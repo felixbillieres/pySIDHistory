@@ -228,6 +228,53 @@ class DRSUAPIClient:
             request['pextClient']['rgb'] = list(drs.getData())
 
             resp = self._dce.request(request)
+
+            # Parse server extension flags (same pattern as secretsdump.py)
+            self._server_flags = 0
+            try:
+                server_ext = drsuapi.DRS_EXTENSIONS_INT()
+                raw = b''.join(resp['ppextServer']['rgb'])
+                # Pad to full struct size if server sent fewer bytes
+                raw += b'\x00' * (len(server_ext) - resp['ppextServer']['cb'])
+                server_ext.fromString(raw)
+                self._server_flags = server_ext['dwFlags']
+
+                logging.info(f"Server DRS flags: 0x{self._server_flags:08x}")
+
+                # Check for ADD_SID_HISTORY support
+                if self._server_flags & self.DRS_EXT_ADD_SID_HISTORY:
+                    logging.info("Server supports DRS_EXT_ADD_SID_HISTORY (opnum 20)")
+                else:
+                    logging.warning(
+                        f"Server flags 0x{self._server_flags:08x} do NOT include "
+                        f"DRS_EXT_ADD_SID_HISTORY (0x{self.DRS_EXT_ADD_SID_HISTORY:08x}). "
+                        f"DRSAddSidHistory may fail."
+                    )
+
+                # Log other key flags for debugging
+                flag_names = {
+                    0x00000001: 'BASE',
+                    0x00000002: 'ASYNCREPL',
+                    0x00000004: 'REMOVEAPI',
+                    0x00000010: 'GETCHG_DEFLATE',
+                    0x00000080: 'ADDENTRY',
+                    0x00000100: 'KCC_EXECUTE',
+                    0x00000400: 'LINKED_VALUE_REPL',
+                    0x00002000: 'CRYPTO_BIND',
+                    0x00008000: 'STRONG_ENCRYPTION',
+                    0x00040000: 'ADD_SID_HISTORY',
+                    0x00080000: 'POST_BETA3',
+                    0x01000000: 'GETCHGREQ_V8',
+                    0x04000000: 'GETCHGREPLY_V6',
+                    0x08000000: 'WHISTLER_BETA3',
+                    0x20000000: 'GETCHGREQ_V10',
+                }
+                present = [n for v, n in flag_names.items() if self._server_flags & v]
+                logging.debug(f"Server capabilities: {', '.join(present)}")
+
+            except Exception as e:
+                logging.debug(f"Could not parse server extensions: {e}")
+
             return resp['phDrs']
 
         except Exception as e:
