@@ -1,12 +1,18 @@
 """
 LDAP Operations
 Handles LDAP queries and modifications for Active Directory.
+Supports users, groups, and computer objects with paged searches.
 """
 
 import logging
-from typing import Optional, List
-from ldap3 import Connection, MODIFY_REPLACE, SUBTREE
+from typing import Optional, List, Dict, Any
+from ldap3 import (
+    Connection, MODIFY_REPLACE, MODIFY_ADD, MODIFY_DELETE, SUBTREE,
+    ALL_ATTRIBUTES
+)
 from ldap3.core.exceptions import LDAPException
+from ldap3.utils.conv import escape_filter_chars
+from ldap3.extend.microsoft.addMembersToGroups import ad_add_members_to_groups
 
 from .sid_utils import SIDConverter
 
@@ -14,32 +20,30 @@ from .sid_utils import SIDConverter
 class LDAPOperations:
     """
     Performs LDAP operations on Active Directory.
+    Supports users, groups, and computer objects.
     """
 
-    def __init__(self, connection: Connection, base_dn: str):
-        """
-        Initialize LDAP operations handler.
+    # Object class filters
+    FILTER_USER = "(&(objectCategory=person)(objectClass=user))"
+    FILTER_GROUP = "(objectClass=group)"
+    FILTER_COMPUTER = "(objectClass=computer)"
+    FILTER_ANY = "(|(objectCategory=person)(objectClass=group)(objectClass=computer))"
 
-        Args:
-            connection: Active LDAP connection
-            base_dn: Base distinguished name for searches
-        """
+    # Page size for paged searches
+    PAGE_SIZE = 1000
+
+    def __init__(self, connection: Connection, base_dn: str):
         self.connection = connection
         self.base_dn = base_dn
         self.sid_converter = SIDConverter()
 
-    def get_user_sid(self, sam_account_name: str) -> Optional[str]:
-        """
-        Retrieve the SID of a user by sAMAccountName.
+    # ─── SID LOOKUPS ──────────────────────────────────────────────────────
 
-        Args:
-            sam_account_name: The sAMAccountName of the user
-
-        Returns:
-            SID as a string, or None if not found
-        """
+    def get_object_sid(self, sam_account_name: str) -> Optional[str]:
+        """Retrieve the SID of any object by sAMAccountName."""
         try:
-            search_filter = f"(sAMAccountName={sam_account_name})"
+            safe_name = escape_filter_chars(sam_account_name)
+            search_filter = f"(sAMAccountName={safe_name})"
             self.connection.search(
                 search_base=self.base_dn,
                 search_filter=search_filter,
@@ -48,30 +52,27 @@ class LDAPOperations:
             )
 
             if not self.connection.entries:
-                logging.error(f"User {sam_account_name} not found")
+                logging.error(f"Object '{sam_account_name}' not found")
                 return None
 
             sid_bytes = self.connection.entries[0].objectSid.raw_values[0]
             sid = self.sid_converter.bytes_to_string(sid_bytes)
-            logging.info(f"Found SID for {sam_account_name}: {sid}")
+            logging.debug(f"SID for {sam_account_name}: {sid}")
             return sid
 
         except LDAPException as e:
             logging.error(f"Error retrieving SID for {sam_account_name}: {e}")
             return None
 
-    def get_user_dn(self, sam_account_name: str) -> Optional[str]:
-        """
-        Retrieve the distinguished name of a user by sAMAccountName.
+    # Keep backward compatibility
+    def get_user_sid(self, sam_account_name: str) -> Optional[str]:
+        return self.get_object_sid(sam_account_name)
 
-        Args:
-            sam_account_name: The sAMAccountName of the user
-
-        Returns:
-            Distinguished name as a string, or None if not found
-        """
+    def get_object_dn(self, sam_account_name: str) -> Optional[str]:
+        """Retrieve the DN of any object by sAMAccountName."""
         try:
-            search_filter = f"(sAMAccountName={sam_account_name})"
+            safe_name = escape_filter_chars(sam_account_name)
+            search_filter = f"(sAMAccountName={safe_name})"
             self.connection.search(
                 search_base=self.base_dn,
                 search_filter=search_filter,
@@ -80,29 +81,74 @@ class LDAPOperations:
             )
 
             if not self.connection.entries:
-                logging.error(f"User {sam_account_name} not found")
+                logging.error(f"Object '{sam_account_name}' not found")
                 return None
 
             dn = str(self.connection.entries[0].distinguishedName)
-            logging.info(f"Found DN for {sam_account_name}: {dn}")
+            logging.debug(f"DN for {sam_account_name}: {dn}")
             return dn
 
         except LDAPException as e:
             logging.error(f"Error retrieving DN for {sam_account_name}: {e}")
             return None
 
-    def get_sid_history(self, sam_account_name: str) -> List[str]:
-        """
-        Retrieve the current SID History of a user.
+    # Keep backward compatibility
+    def get_user_dn(self, sam_account_name: str) -> Optional[str]:
+        return self.get_object_dn(sam_account_name)
 
-        Args:
-            sam_account_name: The sAMAccountName of the user
-
-        Returns:
-            List of SIDs in the user's SID History
-        """
+    def get_object_info(self, sam_account_name: str) -> Optional[Dict[str, Any]]:
+        """Get comprehensive info about an object."""
         try:
-            search_filter = f"(sAMAccountName={sam_account_name})"
+            safe_name = escape_filter_chars(sam_account_name)
+            search_filter = f"(sAMAccountName={safe_name})"
+            self.connection.search(
+                search_base=self.base_dn,
+                search_filter=search_filter,
+                search_scope=SUBTREE,
+                attributes=['objectSid', 'sIDHistory', 'distinguishedName',
+                           'objectClass', 'sAMAccountName', 'memberOf',
+                           'userAccountControl', 'description']
+            )
+
+            if not self.connection.entries:
+                return None
+
+            entry = self.connection.entries[0]
+            info = {
+                'dn': str(entry.distinguishedName),
+                'sam': str(entry.sAMAccountName),
+                'objectClass': list(entry.objectClass.values) if entry.objectClass else [],
+            }
+
+            # SID
+            try:
+                sid_bytes = entry.objectSid.raw_values[0]
+                info['sid'] = self.sid_converter.bytes_to_string(sid_bytes)
+            except Exception:
+                info['sid'] = None
+
+            # SID History
+            info['sidHistory'] = self._extract_sid_history(entry)
+
+            # Description
+            try:
+                info['description'] = str(entry.description) if entry.description else ''
+            except Exception:
+                info['description'] = ''
+
+            return info
+
+        except LDAPException as e:
+            logging.error(f"Error getting object info: {e}")
+            return None
+
+    # ─── SID HISTORY OPERATIONS ───────────────────────────────────────────
+
+    def get_sid_history(self, sam_account_name: str) -> List[str]:
+        """Retrieve the current SID History of an object."""
+        try:
+            safe_name = escape_filter_chars(sam_account_name)
+            search_filter = f"(sAMAccountName={safe_name})"
             self.connection.search(
                 search_base=self.base_dn,
                 search_filter=search_filter,
@@ -111,39 +157,28 @@ class LDAPOperations:
             )
 
             if not self.connection.entries:
-                logging.error(f"User {sam_account_name} not found")
+                logging.error(f"Object '{sam_account_name}' not found")
                 return []
 
-            entry = self.connection.entries[0]
-            if not hasattr(entry, 'sIDHistory'):
-                logging.info(f"No SID History found for {sam_account_name}")
-                return []
-
-            sid_history = []
-            for sid_bytes in entry.sIDHistory.raw_values:
-                sid = self.sid_converter.bytes_to_string(sid_bytes)
-                sid_history.append(sid)
-
-            logging.info(f"Current SID History for {sam_account_name}: {sid_history}")
-            return sid_history
+            return self._extract_sid_history(self.connection.entries[0])
 
         except LDAPException as e:
-            logging.error(f"Error retrieving SID History for {sam_account_name}: {e}")
+            logging.error(f"Error retrieving SID History: {e}")
+            return []
+
+    def _extract_sid_history(self, entry) -> List[str]:
+        """Extract SID History from an LDAP entry."""
+        try:
+            raw_values = entry.sIDHistory.raw_values
+            if not raw_values:
+                return []
+            return [self.sid_converter.bytes_to_string(b) for b in raw_values]
+        except Exception:
             return []
 
     def modify_sid_history(self, user_dn: str, sid_list: List[str]) -> bool:
-        """
-        Modify the SID History attribute of a user.
-
-        Args:
-            user_dn: Distinguished name of the user
-            sid_list: List of SIDs to set as SID History
-
-        Returns:
-            True if successful, False otherwise
-        """
+        """Replace the entire SID History attribute."""
         try:
-            # Convert all SIDs to bytes
             sid_bytes_list = []
             for sid in sid_list:
                 sid_bytes = self.sid_converter.string_to_bytes(sid)
@@ -152,39 +187,204 @@ class LDAPOperations:
                     return False
                 sid_bytes_list.append(sid_bytes)
 
-            changes = {
-                'sIDHistory': [(MODIFY_REPLACE, sid_bytes_list)]
-            }
-
+            changes = {'sIDHistory': [(MODIFY_REPLACE, sid_bytes_list)]}
             success = self.connection.modify(user_dn, changes)
 
             if success:
                 logging.info(f"Successfully modified SID History for {user_dn}")
                 return True
             else:
-                logging.error(f"Failed to modify SID History: {self.connection.result}")
+                result = self.connection.result
+                logging.error(f"Failed to modify SID History: {result}")
+                self._log_modify_error_hint(result)
                 return False
 
         except LDAPException as e:
             logging.error(f"Error modifying SID History: {e}")
             return False
 
+    def add_sid_to_history(self, user_dn: str, sid_string: str) -> bool:
+        """Add a single SID to sIDHistory using MODIFY_ADD."""
+        try:
+            sid_bytes = self.sid_converter.string_to_bytes(sid_string)
+            if not sid_bytes:
+                logging.error(f"Failed to convert SID {sid_string} to bytes")
+                return False
+
+            changes = {'sIDHistory': [(MODIFY_ADD, [sid_bytes])]}
+            success = self.connection.modify(user_dn, changes)
+
+            if success:
+                logging.info(f"Successfully added SID to history for {user_dn}")
+                return True
+            else:
+                result = self.connection.result
+                logging.error(f"Failed to add SID to history: {result}")
+                self._log_modify_error_hint(result)
+                return False
+
+        except LDAPException as e:
+            logging.error(f"Error adding SID to history: {e}")
+            return False
+
+    def remove_sid_from_history(self, user_dn: str, sid_string: str) -> bool:
+        """Remove a single SID from sIDHistory using MODIFY_DELETE."""
+        try:
+            sid_bytes = self.sid_converter.string_to_bytes(sid_string)
+            if not sid_bytes:
+                logging.error(f"Failed to convert SID {sid_string} to bytes")
+                return False
+
+            changes = {'sIDHistory': [(MODIFY_DELETE, [sid_bytes])]}
+            success = self.connection.modify(user_dn, changes)
+
+            if success:
+                logging.info(f"Successfully removed SID from history for {user_dn}")
+                return True
+            else:
+                result = self.connection.result
+                logging.error(f"Failed to remove SID from history: {result}")
+                return False
+
+        except LDAPException as e:
+            logging.error(f"Error removing SID from history: {e}")
+            return False
+
+    def clear_sid_history(self, user_dn: str) -> bool:
+        """Clear all SID History entries."""
+        return self.modify_sid_history(user_dn, [])
+
+    # ─── DOMAIN-WIDE SEARCHES ────────────────────────────────────────────
+
+    def find_all_with_sid_history(self) -> List[Dict[str, Any]]:
+        """
+        Find ALL objects in the domain that have non-empty sIDHistory.
+        Uses paged search for large domains.
+        """
+        results = []
+        search_filter = "(&(sIDHistory=*)(|(objectCategory=person)(objectClass=group)(objectClass=computer)))"
+
+        try:
+            self.connection.search(
+                search_base=self.base_dn,
+                search_filter=search_filter,
+                search_scope=SUBTREE,
+                attributes=['sAMAccountName', 'objectSid', 'sIDHistory',
+                           'objectClass', 'distinguishedName', 'description'],
+                paged_size=self.PAGE_SIZE
+            )
+
+            while True:
+                for entry in self.connection.entries:
+                    obj = self._parse_entry(entry)
+                    if obj:
+                        results.append(obj)
+
+                # Check for more pages
+                cookie = self.connection.result.get('controls', {}).get(
+                    '1.2.840.113556.1.4.319', {}
+                ).get('value', {}).get('cookie')
+
+                if cookie:
+                    self.connection.search(
+                        search_base=self.base_dn,
+                        search_filter=search_filter,
+                        search_scope=SUBTREE,
+                        attributes=['sAMAccountName', 'objectSid', 'sIDHistory',
+                                   'objectClass', 'distinguishedName', 'description'],
+                        paged_size=self.PAGE_SIZE,
+                        paged_cookie=cookie
+                    )
+                else:
+                    break
+
+        except LDAPException as e:
+            logging.error(f"Error scanning domain: {e}")
+
+        return results
+
+    def get_domain_sid(self) -> Optional[str]:
+        """Get the domain SID from the domain object."""
+        try:
+            self.connection.search(
+                search_base=self.base_dn,
+                search_filter="(objectClass=domain)",
+                search_scope=SUBTREE,
+                attributes=['objectSid']
+            )
+
+            if self.connection.entries:
+                sid_bytes = self.connection.entries[0].objectSid.raw_values[0]
+                return self.sid_converter.bytes_to_string(sid_bytes)
+
+            # Fallback: get domain SID from any domain user
+            self.connection.search(
+                search_base=self.base_dn,
+                search_filter="(&(objectCategory=person)(objectClass=user))",
+                search_scope=SUBTREE,
+                attributes=['objectSid'],
+                size_limit=1
+            )
+
+            if self.connection.entries:
+                user_sid = self.sid_converter.bytes_to_string(
+                    self.connection.entries[0].objectSid.raw_values[0]
+                )
+                return self.sid_converter.extract_domain_sid(user_sid)
+
+            return None
+
+        except LDAPException as e:
+            logging.error(f"Error getting domain SID: {e}")
+            return None
+
+    def enumerate_trusts(self) -> List[Dict[str, Any]]:
+        """Enumerate domain trusts via LDAP."""
+        trusts = []
+        try:
+            self.connection.search(
+                search_base=f"CN=System,{self.base_dn}",
+                search_filter="(objectClass=trustedDomain)",
+                search_scope=SUBTREE,
+                attributes=['trustPartner', 'trustDirection', 'trustType',
+                           'trustAttributes', 'flatName', 'securityIdentifier']
+            )
+
+            for entry in self.connection.entries:
+                trust = {
+                    'partner': str(entry.trustPartner) if entry.trustPartner else '',
+                    'flatName': str(entry.flatName) if entry.flatName else '',
+                    'direction': self._parse_trust_direction(entry),
+                    'type': self._parse_trust_type(entry),
+                    'attributes': self._parse_trust_attributes(entry),
+                }
+
+                # Trust SID
+                try:
+                    sid_bytes = entry.securityIdentifier.raw_values[0]
+                    trust['sid'] = self.sid_converter.bytes_to_string(sid_bytes)
+                except Exception:
+                    trust['sid'] = 'Unknown'
+
+                # SID filtering status
+                attrs = int(str(entry.trustAttributes)) if entry.trustAttributes else 0
+                trust['sidFilteringEnabled'] = not bool(attrs & 0x00000040)  # TRUST_ATTRIBUTE_TREAT_AS_EXTERNAL
+                trust['sidHistoryEnabled'] = bool(attrs & 0x00000040)
+
+                trusts.append(trust)
+
+        except LDAPException as e:
+            logging.error(f"Error enumerating trusts: {e}")
+
+        return trusts
+
     def search_by_sid(self, sid: str) -> Optional[str]:
-        """
-        Search for a user or group by SID.
-
-        Args:
-            sid: SID to search for
-
-        Returns:
-            sAMAccountName of the object, or None if not found
-        """
+        """Search for an object by SID, return sAMAccountName."""
         try:
             sid_bytes = self.sid_converter.string_to_bytes(sid)
             if not sid_bytes:
                 return None
 
-            # LDAP search filter for objectSid requires hex representation
             sid_hex = ''.join([f'\\{b:02x}' for b in sid_bytes])
             search_filter = f"(objectSid={sid_hex})"
 
@@ -196,17 +396,139 @@ class LDAPOperations:
             )
 
             if not self.connection.entries:
-                logging.warning(f"No object found with SID {sid}")
                 return None
 
-            entry = self.connection.entries[0]
-            sam_account = str(entry.sAMAccountName)
-            obj_class = str(entry.objectClass)
-            
-            logging.info(f"Found object {sam_account} ({obj_class}) with SID {sid}")
-            return sam_account
+            return str(self.connection.entries[0].sAMAccountName)
 
         except LDAPException as e:
             logging.error(f"Error searching by SID: {e}")
             return None
 
+    def check_sid_history_acl(self, sam_account_name: str) -> Optional[Dict]:
+        """
+        Check the security descriptor on an object to see who can write sIDHistory.
+        Returns basic ACL info (requires nTSecurityDescriptor read access).
+        """
+        try:
+            safe_name = escape_filter_chars(sam_account_name)
+            search_filter = f"(sAMAccountName={safe_name})"
+
+            # Request SD with LDAP_SERVER_SD_FLAGS_OID control
+            # 0x04 = DACL_SECURITY_INFORMATION
+            from ldap3 import SEQUENCE_TYPES
+            self.connection.search(
+                search_base=self.base_dn,
+                search_filter=search_filter,
+                search_scope=SUBTREE,
+                attributes=['nTSecurityDescriptor', 'distinguishedName'],
+                controls=[('1.2.840.113556.1.4.801', True, b'\x30\x03\x02\x01\x04')]
+            )
+
+            if not self.connection.entries:
+                return None
+
+            return {
+                'dn': str(self.connection.entries[0].distinguishedName),
+                'hasSD': bool(self.connection.entries[0].nTSecurityDescriptor),
+                'note': 'Full ACL parsing requires additional tooling (e.g., BloodHound, dacledit)'
+            }
+
+        except Exception as e:
+            logging.debug(f"ACL check failed (may need elevated privileges): {e}")
+            return None
+
+    # ─── HELPER METHODS ──────────────────────────────────────────────────
+
+    def _parse_entry(self, entry) -> Optional[Dict[str, Any]]:
+        """Parse an LDAP entry into a dict."""
+        try:
+            obj = {
+                'dn': str(entry.distinguishedName),
+                'sam': str(entry.sAMAccountName),
+                'objectClass': list(entry.objectClass.values) if entry.objectClass else [],
+            }
+
+            try:
+                sid_bytes = entry.objectSid.raw_values[0]
+                obj['sid'] = self.sid_converter.bytes_to_string(sid_bytes)
+            except Exception:
+                obj['sid'] = None
+
+            obj['sidHistory'] = self._extract_sid_history(entry)
+
+            try:
+                obj['description'] = str(entry.description) if entry.description else ''
+            except Exception:
+                obj['description'] = ''
+
+            return obj
+        except Exception as e:
+            logging.debug(f"Error parsing entry: {e}")
+            return None
+
+    @staticmethod
+    def _parse_trust_direction(entry) -> str:
+        """Parse trust direction flags."""
+        try:
+            direction = int(str(entry.trustDirection))
+            mapping = {0: "Disabled", 1: "Inbound", 2: "Outbound", 3: "Bidirectional"}
+            return mapping.get(direction, f"Unknown ({direction})")
+        except Exception:
+            return "Unknown"
+
+    @staticmethod
+    def _parse_trust_type(entry) -> str:
+        """Parse trust type flags."""
+        try:
+            trust_type = int(str(entry.trustType))
+            mapping = {1: "Windows NT", 2: "Active Directory", 3: "MIT Kerberos"}
+            return mapping.get(trust_type, f"Unknown ({trust_type})")
+        except Exception:
+            return "Unknown"
+
+    @staticmethod
+    def _parse_trust_attributes(entry) -> List[str]:
+        """Parse trust attribute flags into readable list."""
+        try:
+            attrs = int(str(entry.trustAttributes))
+        except Exception:
+            return []
+
+        flags = []
+        attr_map = {
+            0x00000001: "NON_TRANSITIVE",
+            0x00000002: "UPLEVEL_ONLY",
+            0x00000004: "QUARANTINED_DOMAIN",
+            0x00000008: "FOREST_TRANSITIVE",
+            0x00000010: "CROSS_ORGANIZATION",
+            0x00000020: "WITHIN_FOREST",
+            0x00000040: "TREAT_AS_EXTERNAL",
+            0x00000080: "USES_RC4_ENCRYPTION",
+            0x00000200: "CROSS_ORGANIZATION_NO_TGT_DELEGATION",
+            0x00000400: "PIM_TRUST",
+        }
+
+        for flag_val, flag_name in attr_map.items():
+            if attrs & flag_val:
+                flags.append(flag_name)
+
+        return flags
+
+    @staticmethod
+    def _log_modify_error_hint(result: dict):
+        """Log hints for common sIDHistory modification errors."""
+        description = str(result.get('description', ''))
+        message = str(result.get('message', ''))
+
+        if 'insufficientAccessRights' in description or '00002098' in message:
+            logging.error("Hint: sIDHistory modification requires 'Write sIDHistory' "
+                         "control access right (or Domain Admin privileges)")
+            logging.error("Hint: Direct LDAP ADD to sIDHistory is blocked on most DCs.")
+            logging.error("Hint: Consider using --method drsuapi for RPC-based injection")
+        elif 'unwillingToPerform' in description or '0000209A' in message:
+            logging.error("Hint: The DC refused the operation. Common causes:")
+            logging.error("  - sIDHistory cannot be added via LDAP (use --method drsuapi)")
+            logging.error("  - SID Filtering (quarantine) is enabled on the trust")
+            logging.error("  - The SID belongs to a well-known/protected group")
+        elif 'constraintViolation' in description:
+            logging.error("Hint: Constraint violation - the SID may already exist or be invalid")

