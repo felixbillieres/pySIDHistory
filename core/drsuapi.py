@@ -17,7 +17,7 @@ from typing import Optional, Tuple
 
 try:
     from impacket.dcerpc.v5 import drsuapi, transport, epm
-    from impacket.dcerpc.v5.ndr import NDRCALL, NDRSTRUCT, NDRPOINTER, NDRUNION, NULL
+    from impacket.dcerpc.v5.ndr import NDRCALL, NDRSTRUCT, NDRPOINTER, NDRUNION, NDRUniConformantArray, NULL
     from impacket.dcerpc.v5.dtypes import (
         DWORD, LPWSTR, ULONG, WSTR, LONG, NDRPOINTERNULL
     )
@@ -40,13 +40,14 @@ DS_ADDSID_FLAG_PRIVATE_DEL_SRC_OBJ = 0x80000000
 
 if HAS_IMPACKET:
 
-    class WCHAR_ARRAY(NDRSTRUCT):
-        """Variable-length WCHAR array for credential fields."""
-        structure = (
-            ('MaximumCount', ULONG),
-            ('Offset', ULONG),
-            ('ActualCount', ULONG),
-            ('Data', ':'),
+    # Conformant WCHAR array for [size_is(n)] WCHAR * credential fields
+    # (NOT the same as LPWSTR which is [string] WCHAR * with offset/actualcount)
+    class WCHAR_SIZED_ARRAY(NDRUniConformantArray):
+        item = '<H'  # unsigned short = WCHAR (2 bytes)
+
+    class PWCHAR_SIZED_ARRAY(NDRPOINTER):
+        referent = (
+            ('Data', WCHAR_SIZED_ARRAY),
         )
 
     class DRS_MSG_ADDSIDREQ_V1(NDRSTRUCT):
@@ -74,11 +75,11 @@ if HAS_IMPACKET:
             ('SrcPrincipal', LPWSTR),
             ('SrcDomainController', LPWSTR),
             ('SrcCredsUserLength', DWORD),
-            ('SrcCredsUser', LPWSTR),
+            ('SrcCredsUser', PWCHAR_SIZED_ARRAY),
             ('SrcCredsDomainLength', DWORD),
-            ('SrcCredsDomain', LPWSTR),
+            ('SrcCredsDomain', PWCHAR_SIZED_ARRAY),
             ('SrcCredsPasswordLength', DWORD),
-            ('SrcCredsPassword', LPWSTR),
+            ('SrcCredsPassword', PWCHAR_SIZED_ARRAY),
             ('DstDomain', LPWSTR),
             ('DstPrincipal', LPWSTR),
         )
@@ -282,24 +283,27 @@ class DRSUAPIClient:
             else:
                 v1['SrcDomainController'] = NULL
 
-            # Source credentials
+            # Source credentials (conformant WCHAR arrays, not LPWSTR strings)
             if src_creds_user:
+                wchars = [ord(c) for c in src_creds_user]
                 v1['SrcCredsUserLength'] = len(src_creds_user)
-                v1['SrcCredsUser'] = src_creds_user + '\x00'
+                v1['SrcCredsUser'] = wchars
             else:
                 v1['SrcCredsUserLength'] = 0
                 v1['SrcCredsUser'] = NULL
 
             if src_creds_domain:
+                wchars = [ord(c) for c in src_creds_domain]
                 v1['SrcCredsDomainLength'] = len(src_creds_domain)
-                v1['SrcCredsDomain'] = src_creds_domain + '\x00'
+                v1['SrcCredsDomain'] = wchars
             else:
                 v1['SrcCredsDomainLength'] = 0
                 v1['SrcCredsDomain'] = NULL
 
             if src_creds_password:
+                wchars = [ord(c) for c in src_creds_password]
                 v1['SrcCredsPasswordLength'] = len(src_creds_password)
-                v1['SrcCredsPassword'] = src_creds_password + '\x00'
+                v1['SrcCredsPassword'] = wchars
             else:
                 v1['SrcCredsPasswordLength'] = 0
                 v1['SrcCredsPassword'] = NULL
@@ -416,12 +420,16 @@ class DRSUAPIClient:
             87: "Invalid parameter (ERROR_INVALID_PARAMETER)",
             1332: "No mapping between account names and security IDs (ERROR_NONE_MAPPED)",
             1355: "The specified domain either does not exist or could not be contacted (ERROR_NO_SUCH_DOMAIN)",
-            8440: "The source domain is not in the same forest (ERROR_DS_SRC_SID_EXISTS_IN_FOREST)",
-            8447: "Auditing not enabled on source or destination (ERROR_DS_MUST_BE_RUN_ON_DST_DC)",
+            8440: "Source SID already exists in destination forest (ERROR_DS_SRC_SID_EXISTS_IN_FOREST)",
+            8447: "Must be run on destination DC (ERROR_DS_MUST_BE_RUN_ON_DST_DC)",
             8490: "Source and destination must be in different forests for flags=0 (ERROR_DS_CROSS_DOM_MOVE_ERROR)",
             8505: "The source principal was not found (ERROR_DS_OBJ_NOT_FOUND)",
-            8521: "Domain is not in native mode (ERROR_DS_NOT_INSTALLED)",
-            8536: "Target principal already has this SID (ERROR_DS_SID_DUPLICATED)",
+            8521: "Source domain auditing not enabled (ERROR_DS_SOURCE_AUDITING_NOT_ENABLED). "
+                  "Enable 'Audit account management' (Success+Failure) on the source DC",
+            8534: "Source and destination are in the same forest (ERROR_DS_SRC_AND_DST_NC_IDENTICAL). "
+                  "DRSAddSidHistory (flags=0) requires cross-forest operation",
+            8536: "Destination domain auditing not enabled (ERROR_DS_DESTINATION_AUDITING_NOT_ENABLED). "
+                  "Enable 'Audit account management' (Success+Failure) on the destination DC",
             8547: "Must run on destination DC (ERROR_DS_MUST_RUN_ON_DST_DC)",
             8548: "Source DC could not be contacted (ERROR_DS_CANT_FIND_DC_FOR_SRC_DOMAIN)",
             8557: "Source and destination principal type mismatch (ERROR_DS_SRC_OBJ_NOT_GROUP_OR_USER)",

