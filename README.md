@@ -25,9 +25,9 @@ pip install -r requirements.txt
 The core feature — injects a source user's SID into a target's `sIDHistory` via `DRSAddSidHistory` (opnum 20). This is the RPC call that Microsoft's ADMT uses for domain migrations, now available from Linux. Bypasses the DC's SAM layer without patching memory (no mimikatz) and without offline ntds.dit access (no DSInternals).
 
 ```bash
-python3 sidhistory.py -d DST.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
-    --target victim --source-user admin --source-domain SRC.LOCAL \
-    --src-username admin --src-password 'Pass123' --src-domain SRC.LOCAL
+python3 sidhistory.py -d $DOMAIN -u $USER -p '$PASSWORD' --dc-ip $DC_IP \
+    --target $TARGET --source-user $SOURCE_USER --source-domain $SOURCE_DOMAIN \
+    --src-username $SRC_USER --src-password '$SRC_PASSWORD' --src-domain $SRC_DOMAIN
 ```
 
 ![DRSUAPI cross-forest injection](docs/drsuapi_injection.png)
@@ -41,8 +41,8 @@ python3 sidhistory.py -d DST.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
 Show sIDHistory entries for a specific object with SID resolution.
 
 ```bash
-python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
-    --query victim
+python3 sidhistory.py -d $DOMAIN -u $USER -p '$PASSWORD' --dc-ip $DC_IP \
+    --query $TARGET
 ```
 
 ![Query sIDHistory](docs/query.png)
@@ -52,7 +52,7 @@ python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
 Scan every object in the domain for sIDHistory entries. Includes risk assessment (CRITICAL/HIGH/MEDIUM/LOW) and SID resolution.
 
 ```bash
-python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
+python3 sidhistory.py -d $DOMAIN -u $USER -p '$PASSWORD' --dc-ip $DC_IP \
     --audit
 ```
 
@@ -63,7 +63,7 @@ python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
 Export audit results as JSON for SIEM ingestion or automated processing.
 
 ```bash
-python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
+python3 sidhistory.py -d $DOMAIN -u $USER -p '$PASSWORD' --dc-ip $DC_IP \
     --audit -o json --output-file audit.json
 ```
 
@@ -74,7 +74,7 @@ python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
 List all domain trusts with SID filtering status — identify where SID History attacks are possible.
 
 ```bash
-python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
+python3 sidhistory.py -d $DOMAIN -u $USER -p '$PASSWORD' --dc-ip $DC_IP \
     --enum-trusts
 ```
 
@@ -85,8 +85,8 @@ python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
 Resolve a sAMAccountName to its SID.
 
 ```bash
-python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
-    --lookup admin
+python3 sidhistory.py -d $DOMAIN -u $USER -p '$PASSWORD' --dc-ip $DC_IP \
+    --lookup $TARGET
 ```
 
 ![SID lookup](docs/lookup.png)
@@ -96,7 +96,7 @@ python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
 Show well-known privileged SIDs for the target domain (useful for identifying attack artifacts in sIDHistory).
 
 ```bash
-python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
+python3 sidhistory.py -d $DOMAIN -u $USER -p '$PASSWORD' --dc-ip $DC_IP \
     --list-presets
 ```
 
@@ -106,15 +106,13 @@ python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
 
 ## Authentication Methods
 
-5 authentication methods supported:
-
-| Method | Flags | Protocol |
-|--------|-------|----------|
-| NTLM (password) | `-u admin -p Pass123` | ldap3 NTLM |
-| Pass-the-Hash | `-u admin --ntlm-hash <LM:NT>` | impacket + ldap3 |
-| Kerberos | `--kerberos --ccache ticket.ccache` | ldap3 SASL/GSSAPI |
-| Certificate (PTC) | `--certificate --cert-file X --key-file Y` | LDAPS + SASL EXTERNAL |
-| SIMPLE bind | `--simple -u admin -p Pass123 --use-ssl` | ldap3 SIMPLE |
+| Method | Flags |
+|--------|-------|
+| NTLM (password) | `-u $USER -p '$PASSWORD'` |
+| Pass-the-Hash | `-u $USER --ntlm-hash $NT_HASH` |
+| Kerberos | `--kerberos --ccache $CCACHE_FILE` |
+| Certificate (PTC) | `--certificate --cert-file $CERT_FILE --key-file $KEY_FILE` |
+| SIMPLE bind | `--simple -u $USER -p '$PASSWORD' --use-ssl` |
 
 ---
 
@@ -183,7 +181,7 @@ Client (Linux)                          Domain Controller
 |---|---|
 | Cross-forest trust | Source and destination must be in different forests |
 | Auditing on both DCs | `auditpol /set /category:"Account Management" /success:enable /failure:enable` |
-| Audit groups | Local groups `SRCDOM$$$` and `DSTDOM$$$` must exist on both DCs |
+| Audit groups | Local groups `$SRC_DOMAIN$$$` and `$DST_DOMAIN$$$` must exist on both DCs |
 | Source domain credentials | `--src-username`, `--src-password`, `--src-domain` |
 | Domain Admin on destination | The authenticated user must be DA in the target domain |
 
