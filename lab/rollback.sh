@@ -24,41 +24,44 @@ LAB2_USERS="target-user migrate-user svc-sql da-admin2"
 echo "=== pySIDHistory Lab Rollback ==="
 echo ""
 
-# ── Clear sIDHistory on lab1.local ──
-echo "[*] Clearing sIDHistory on $DC1_DOMAIN..."
-for user in $LAB1_USERS; do
-    echo -n "    $user: "
-    output=$(python3 sidhistory.py \
-        -d "$DC1_DOMAIN" -u "$DC1_USER" -p "$PASS" \
-        --dc-ip "$DC1_IP" \
-        --target "$user" --clear -q 2>&1)
-    if echo "$output" | grep -q "Cleared\|No sIDHistory\|not found"; then
-        echo "OK"
-    elif echo "$output" | grep -q "empty\|no entries"; then
-        echo "already clean"
-    else
-        echo "done"
-    fi
-done
+# ── Clear sIDHistory on both domains via LDAP MODIFY_DELETE ──
+echo "[*] Clearing sIDHistory on both domains..."
+python3 << PYEOF
+import sys
+sys.path.insert(0, '$SCRIPT_DIR')
+from ldap3 import Server, Connection, NTLM, SUBTREE, MODIFY_DELETE
 
-echo ""
+domains = [
+    ('$DC1_IP', '$DC1_DOMAIN', '$DC1_USER', '$PASS', '$LAB1_USERS'.split()),
+    ('$DC2_IP', '$DC2_DOMAIN', '$DC2_USER', '$PASS', '$LAB2_USERS'.split()),
+]
 
-# ── Clear sIDHistory on lab2.local ──
-echo "[*] Clearing sIDHistory on $DC2_DOMAIN..."
-for user in $LAB2_USERS; do
-    echo -n "    $user: "
-    output=$(python3 sidhistory.py \
-        -d "$DC2_DOMAIN" -u "$DC2_USER" -p "$PASS" \
-        --dc-ip "$DC2_IP" \
-        --target "$user" --clear -q 2>&1)
-    if echo "$output" | grep -q "Cleared\|No sIDHistory\|not found"; then
-        echo "OK"
-    elif echo "$output" | grep -q "empty\|no entries"; then
-        echo "already clean"
-    else
-        echo "done"
-    fi
-done
+for dc_ip, domain, user, password, users in domains:
+    base_dn = ','.join(f'DC={p}' for p in domain.split('.'))
+    server = Server(dc_ip, port=389, use_ssl=False)
+    conn = Connection(server, user=f'{domain}\\\\{user}', password=password, authentication=NTLM, auto_bind=True)
+    print(f'  [{domain}]')
+    for u in users:
+        conn.search(base_dn, f'(sAMAccountName={u})', SUBTREE, attributes=['sIDHistory'])
+        if not conn.entries:
+            print(f'    {u}: not found')
+            continue
+        entry = conn.entries[0]
+        try:
+            raw = entry.sIDHistory.raw_values
+            if not raw:
+                print(f'    {u}: clean')
+                continue
+        except:
+            print(f'    {u}: clean')
+            continue
+        conn.modify(str(entry.entry_dn), {'sIDHistory': [(MODIFY_DELETE, list(raw))]})
+        if conn.result['result'] == 0:
+            print(f'    {u}: cleared {len(raw)} SID(s)')
+        else:
+            print(f'    {u}: failed ({conn.result["description"]})')
+    conn.unbind()
+PYEOF
 
 echo ""
 

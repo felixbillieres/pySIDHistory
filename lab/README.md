@@ -97,10 +97,6 @@ python3 sidhistory.py -d lab1.local -u da-admin -p 'Password123!' --dc-ip 192.16
 python3 sidhistory.py -d lab1.local -u da-admin -p 'Password123!' --dc-ip 192.168.56.10 \
     --enum-trusts
 
-# Clear sIDHistory (cleanup)
-python3 sidhistory.py -d lab1.local -u da-admin -p 'Password123!' --dc-ip 192.168.56.10 \
-    --target user1 --clear
-
 # Full lab rollback (reset all users)
 ./lab/rollback.sh
 ```

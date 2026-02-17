@@ -7,7 +7,7 @@ Supports users, groups, and computer objects with paged searches.
 import logging
 from typing import Optional, List, Dict, Any
 from ldap3 import (
-    Connection, MODIFY_DELETE, SUBTREE,
+    Connection, SUBTREE,
     ALL_ATTRIBUTES
 )
 from ldap3.core.exceptions import LDAPException
@@ -175,74 +175,6 @@ class LDAPOperations:
             return [self.sid_converter.bytes_to_string(b) for b in raw_values]
         except Exception:
             return []
-
-    def remove_sid_from_history(self, user_dn: str, sid_string: str) -> bool:
-        """Remove a single SID from sIDHistory using MODIFY_DELETE."""
-        try:
-            sid_bytes = self.sid_converter.string_to_bytes(sid_string)
-            if not sid_bytes:
-                logging.error(f"Failed to convert SID {sid_string} to bytes")
-                return False
-
-            changes = {'sIDHistory': [(MODIFY_DELETE, [sid_bytes])]}
-            success = self.connection.modify(user_dn, changes)
-
-            if success:
-                logging.info(f"Successfully removed SID from history for {user_dn}")
-                return True
-            else:
-                result = self.connection.result
-                logging.error(f"Failed to remove SID from history: {result}")
-                return False
-
-        except LDAPException as e:
-            logging.error(f"Error removing SID from history: {e}")
-            return False
-
-    def clear_sid_history(self, user_dn: str) -> bool:
-        """Clear all SID History entries using MODIFY_DELETE on each SID.
-
-        MODIFY_REPLACE with [] is blocked by the SAM layer on most DCs,
-        so we delete each SID individually via MODIFY_DELETE instead.
-        """
-        try:
-            # Get current sIDHistory as raw bytes
-            sam_name = user_dn.split(',')[0].split('=')[1] if '=' in user_dn else user_dn
-            self.connection.search(
-                search_base=self.base_dn,
-                search_filter=f"(distinguishedName={escape_filter_chars(user_dn)})",
-                search_scope=SUBTREE,
-                attributes=['sIDHistory']
-            )
-
-            if not self.connection.entries:
-                logging.warning(f"Object not found: {user_dn}")
-                return True
-
-            entry = self.connection.entries[0]
-            try:
-                raw_values = entry.sIDHistory.raw_values
-                if not raw_values:
-                    logging.info(f"No sIDHistory to clear on {user_dn}")
-                    return True
-            except Exception:
-                logging.info(f"No sIDHistory to clear on {user_dn}")
-                return True
-
-            # Delete all SIDs at once via MODIFY_DELETE
-            changes = {'sIDHistory': [(MODIFY_DELETE, list(raw_values))]}
-            success = self.connection.modify(user_dn, changes)
-
-            if success:
-                logging.info(f"Cleared {len(raw_values)} SID(s) from sIDHistory")
-                return True
-            else:
-                logging.error(f"Failed to clear SID History: {self.connection.result}")
-                return False
-
-        except LDAPException as e:
-            logging.error(f"Error clearing SID History: {e}")
-            return False
 
     # ─── DOMAIN-WIDE SEARCHES ────────────────────────────────────────────
 

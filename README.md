@@ -34,7 +34,7 @@ python3 sidhistory.py -d DST.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
 
 ---
 
-## Blue Team — Audit & Cleanup
+## Blue Team — Audit & Recon
 
 ### Query sIDHistory
 
@@ -102,48 +102,6 @@ python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
 
 ![List presets](docs/list_presets.png)
 
-### Clear sIDHistory
-
-Remove all sIDHistory entries from an object.
-
-```bash
-python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
-    --target victim --clear
-```
-
-![Clear sIDHistory](docs/clear.png)
-
-### Clean Same-Domain SIDs
-
-Remove only same-domain SIDs (attack artifacts) while preserving cross-domain SIDs from legitimate migrations.
-
-```bash
-python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
-    --target victim --clean-same-domain
-```
-
-![Clean same-domain](docs/clean_same_domain.png)
-
-### Remove Specific SID
-
-Remove a single SID entry from sIDHistory.
-
-```bash
-python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
-    --target victim --sid S-1-5-21-xxx-512 --remove
-```
-
-![Remove specific SID](docs/remove_sid.png)
-
-### Bulk Clear
-
-Clear sIDHistory from multiple objects at once using a file.
-
-```bash
-python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
-    --targets-file users.txt --bulk-clear
-```
-
 ---
 
 ## Authentication Methods
@@ -196,7 +154,7 @@ sidhistory.py              CLI entry point & argument handling
   └── core/
       ├── attack.py        Orchestrator (wires everything together)
       ├── auth.py          Authentication (5 methods, ldap3 + impacket)
-      ├── ldap_operations.py  LDAP queries & modifications
+      ├── ldap_operations.py  LDAP queries & domain enumeration
       ├── drsuapi.py       DRSAddSidHistory RPC (opnum 20, first Python impl)
       ├── scanner.py       Domain-wide auditing & risk assessment
       ├── sid_utils.py     SID binary conversion, presets, well-known SIDs

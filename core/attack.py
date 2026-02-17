@@ -5,7 +5,7 @@ DRSUAPI calls, scanning, and output formatting.
 """
 
 import logging
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
 
 from .auth import AuthenticationManager
 from .ldap_operations import LDAPOperations
@@ -19,7 +19,7 @@ class SIDHistoryAttack:
     Main class for performing SID History operations from a remote Linux host.
 
     Injection uses DRSUAPI DRSAddSidHistory (opnum 20) — the only method that
-    bypasses the DC's SAM layer. Cleanup/removal uses LDAP MODIFY_DELETE.
+    bypasses the DC's SAM layer. Audit features use read-only LDAP queries.
     """
 
     def __init__(self, dc_ip: str, domain: str, dc_hostname: Optional[str] = None):
@@ -136,13 +136,6 @@ class SIDHistoryAttack:
         """Get the domain SID."""
         return self.domain_sid
 
-    def resolve_preset(self, preset_name: str) -> Optional[str]:
-        """Resolve a preset name to a full SID."""
-        if not self.domain_sid:
-            logging.error("Domain SID not available - cannot resolve preset")
-            return None
-        return SIDConverter.resolve_preset(preset_name, self.domain_sid)
-
     # ─── SID HISTORY INJECTION (DRSUAPI) ──────────────────────────────
 
     def inject_sid_history(self, target_user: str, source_user: str,
@@ -191,80 +184,6 @@ class SIDHistoryAttack:
 
         return success
 
-    # ─── SID HISTORY REMOVAL ─────────────────────────────────────────
-
-    def remove_sid_from_history(self, target_user: str, sid_to_remove: str) -> bool:
-        """Remove a specific SID from sIDHistory."""
-        if not self.ldap_ops:
-            logging.error("Not connected")
-            return False
-
-        try:
-            user_dn = self.ldap_ops.get_object_dn(target_user)
-            if not user_dn:
-                return False
-
-            current = self.ldap_ops.get_sid_history(target_user)
-            if sid_to_remove not in current:
-                logging.warning(f"SID {sid_to_remove} not in sIDHistory")
-                return True
-
-            success = self.ldap_ops.remove_sid_from_history(user_dn, sid_to_remove)
-            if success:
-                logging.info(f"Removed {sid_to_remove} from {target_user}")
-            return success
-
-        except Exception as e:
-            logging.error(f"Error removing SID: {e}")
-            return False
-
-    def clear_sid_history(self, target_user: str) -> bool:
-        """Clear all sIDHistory entries."""
-        if not self.ldap_ops:
-            logging.error("Not connected")
-            return False
-
-        try:
-            user_dn = self.ldap_ops.get_object_dn(target_user)
-            if not user_dn:
-                return False
-
-            success = self.ldap_ops.clear_sid_history(user_dn)
-            if success:
-                logging.info(f"Cleared sIDHistory for {target_user}")
-            return success
-
-        except Exception as e:
-            logging.error(f"Error clearing sIDHistory: {e}")
-            return False
-
-    # ─── BULK OPERATIONS ──────────────────────────────────────────────
-
-    def bulk_clear(self, targets: List[str]) -> Dict[str, bool]:
-        """Clear sIDHistory from multiple targets."""
-        results = {}
-        for target in targets:
-            logging.info(f"Clearing {target}...")
-            results[target] = self.clear_sid_history(target)
-        return results
-
-    def clean_same_domain_sids(self, target_user: str) -> bool:
-        """Remove only same-domain SIDs from sIDHistory (preserve migration SIDs)."""
-        if not self.domain_sid:
-            logging.error("Domain SID unknown - cannot identify same-domain SIDs")
-            return False
-
-        current = self.get_current_sid_history(target_user)
-        success = True
-
-        for sid in current:
-            if SIDConverter.is_same_domain_sid(sid, self.domain_sid):
-                logging.info(f"Removing same-domain SID: {sid}")
-                if not self.remove_sid_from_history(target_user, sid):
-                    success = False
-
-        return success
-
     # ─── SCANNING & AUDITING ──────────────────────────────────────────
 
     def full_audit(self) -> Optional[AuditReport]:
@@ -305,8 +224,7 @@ class SIDHistoryAttack:
                   "  On the destination DC, run: auditpol /set /category:\"Account Management\" /success:enable /failure:enable\n"
                   "  Also enable it on the source DC if not already done",
             8547: "You must connect to the DC that holds the destination domain NC",
-            8490: "Cross-forest variant requires source and destination in different forests.\n"
-                  "For same-domain, create a sacrificial account and use --method drsuapi-delsrc",
+            8490: "Cross-forest variant requires source and destination in different forests.",
             8447: "Enable auditing: 'Audit account management' must be set to Success/Failure\n"
                   "  in both source and destination domain GPOs",
             8548: "Source DC could not be reached. Ensure:\n"
