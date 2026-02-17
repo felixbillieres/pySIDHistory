@@ -72,28 +72,34 @@ class AuthenticationManager:
         )
 
     def connect_ntlm(self, username: str, password: str,
-                    use_ssl: bool = False) -> Optional[Connection]:
+                    use_ssl: bool = False, retries: int = 3) -> Optional[Connection]:
         """Connect using NTLM authentication with password."""
-        try:
-            server = self.create_server(use_ssl=use_ssl)
-            user_dn = f"{self.domain}\\{username}"
+        import time
+        user_dn = f"{self.domain}\\{username}"
 
-            connection = Connection(
-                server,
-                user=user_dn,
-                password=password,
-                authentication=NTLM,
-                auto_bind=True
-            )
+        for attempt in range(retries):
+            try:
+                server = self.create_server(use_ssl=use_ssl)
+                connection = Connection(
+                    server,
+                    user=user_dn,
+                    password=password,
+                    authentication=NTLM,
+                    auto_bind=True
+                )
 
-            self._username = username
-            self._password = password
-            logging.info(f"Successfully authenticated via NTLM as {username}")
-            return connection
+                self._username = username
+                self._password = password
+                logging.info(f"Successfully authenticated via NTLM as {username}")
+                return connection
 
-        except Exception as e:
-            logging.error(f"NTLM authentication failed: {e}")
-            return None
+            except Exception as e:
+                if attempt < retries - 1:
+                    logging.debug(f"NTLM auth attempt {attempt+1} failed: {e}, retrying...")
+                    time.sleep(2)
+                else:
+                    logging.error(f"NTLM authentication failed: {e}")
+                    return None
 
     def connect_ntlm_hash(self, username: str, nt_hash: str,
                          use_ssl: bool = False) -> Optional[Connection]:

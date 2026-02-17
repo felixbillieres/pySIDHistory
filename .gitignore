@@ -133,7 +133,7 @@ dmypy.json
 .DS_Store
 Thumbs.db
 
-# Documentation (keep README.md only)
+# Old docs (replaced by docs/ folder)
 ARCHITECTURE.md
 EXAMPLES.md
 FEATURES.md

@@ -721,3 +721,200 @@ def is_same_domain_sid(sid_string: str, domain_sid: str) -> bool:
 
 This single check catches most SID History attacks with zero false positives
 in non-migration environments.
+
+---
+
+## Troubleshooting: Problems Discovered During Development
+
+This section documents real issues encountered during lab testing and development.
+These are hard-won lessons that aren't in any documentation.
+
+### NDR Serialization: The Union Discriminant Bug
+
+**Symptom**: `rpc_x_bad_stub_data` when calling opnum 20, even with correct structures.
+
+**Root cause**: The `pmsgIn` parameter is defined as:
+
+```c
+[in, ref, switch_is(dwInVersion)] DRS_MSG_ADDSIDREQ *pmsgIn
+```
+
+This is a **non-encapsulated NDR union**. In NDR wire format, a non-encapsulated union
+requires an **explicit discriminant value** before the union arm body. The discriminant
+is `dwInVersion` (always 1), so the wire format must be:
+
+```
+[hDrs: 20 bytes] [dwInVersion: 0x01000000] [discriminant: 0x01000000] [V1 body...]
+```
+
+impacket's `NDRCALL` framework does NOT automatically insert the union discriminant
+for non-encapsulated unions. It handles encapsulated unions (where the discriminant
+is part of the union struct) but not the `switch_is()` pattern where the discriminant
+is a separate parameter.
+
+**Fix**: We build raw NDR bytes manually with `struct.pack('<I', 1)` for both
+`dwInVersion` and the union discriminant, then use `dce.call(20, raw_request)`
+instead of `dce.request(request)`.
+
+This was the hardest bug to find because the error message (`rpc_x_bad_stub_data`)
+gives zero indication of what's wrong with the serialization.
+
+### NDR Serialization: Credential Fields Are Conformant Arrays, Not LPWSTR
+
+**Symptom**: `rpc_x_bad_stub_data` (same error, different cause).
+
+The credential fields in `DRS_MSG_ADDSIDREQ_V1` look like strings but they're not:
+
+```c
+[range(0,256)] DWORD SrcCredsUserLength;
+[size_is(SrcCredsUserLength)] WCHAR *SrcCredsUser;   // NOT [string]!
+```
+
+Note the absence of the `[string]` attribute. These are **conformant arrays** of WCHAR,
+not null-terminated strings. In NDR:
+
+- `[string] WCHAR *` → `LPWSTR` → conformant varying array (max_count + offset + actual_count)
+- `[size_is(N)] WCHAR *` → conformant array (max_count only, size from preceding field)
+
+Using `LPWSTR` for these fields produces incorrect NDR encoding. The fix is to use
+`NDRUniConformantArray` or encode them manually as fixed-size arrays.
+
+### DRS_EXT_ADD_SID_HISTORY: Check the Server's Capability Flags
+
+**Symptom**: `Win32Error=1` (ERROR_INVALID_FUNCTION) from DRSAddSidHistory, despite
+correct NDR serialization and valid credentials.
+
+After `DRSBind`, the server returns its capability flags in `DRS_EXTENSIONS_INT.dwFlags`.
+The bit `DRS_EXT_ADD_SID_HISTORY` (0x00040000) indicates the DC supports opnum 20.
+
+**Discovery**: Windows Server 2019 (StefanScherer/windows_2019 Vagrant box) returns
+server flags `0x6d693a83`, which does NOT include bit 0x00040000. The DC simply
+doesn't support `IDL_DRSAddSidHistory` in this configuration.
+
+This is a **server-side limitation**, not a client bug. The tool now logs the server's
+DRS extension flags after DRSBind and warns if `DRS_EXT_ADD_SID_HISTORY` is missing.
+
+**Possible causes**:
+- Certain Windows Server editions/versions may not implement opnum 20
+- Missing prerequisites (auditing not fully configured, registry keys)
+- The operation may require Windows Server with specific roles/features
+
+**Recommendation**: Always check the DRSBind response flags before attempting opnum 20.
+If the flag is missing, fall back to cross-forest or same-domain (`DEL_SRC_OBJ`) variants,
+or use a different DC.
+
+### Forest Trust Creation: External vs Forest Trust
+
+**Symptom**: `netdom trust /add` creates an **external trust**, not a forest trust.
+SID History doesn't work across external trusts the same way.
+
+`netdom trust` with `/add` creates external trusts by default. The `/transitive:yes`
+flag is NOT a valid `netdom` parameter (despite appearing in some documentation).
+Forest trusts are transitive by definition.
+
+**Fix**: Use .NET `Forest.CreateTrustRelationship()` for proper forest trusts:
+
+```powershell
+$localForest = [System.DirectoryServices.ActiveDirectory.Forest]::GetCurrentForest()
+$remoteContext = New-Object System.DirectoryServices.ActiveDirectory.DirectoryContext(
+    "Forest", "lab2.local", "administrator@lab2.local", "V@grant123!")
+$remoteForest = [System.DirectoryServices.ActiveDirectory.Forest]::GetForest($remoteContext)
+$localForest.CreateTrustRelationship($remoteForest, "Bidirectional")
+```
+
+Then enable SID History and disable quarantine:
+
+```powershell
+netdom trust lab1.local /domain:lab2.local /enablesidhistory:yes /ud:administrator /pd:password
+netdom trust lab1.local /domain:lab2.local /quarantine:no /ud:administrator /pd:password
+```
+
+**Trust attribute flags to verify**:
+- `FOREST_TRANSITIVE` (0x08) = proper forest trust
+- `TREAT_AS_EXTERNAL` (0x40) = SID History allowed across trust
+- `QUARANTINED_DOMAIN` (0x04) = SID filtering ON (bad for SID History attacks)
+- Ideal: `0x48` (72) = `FOREST_TRANSITIVE` + `TREAT_AS_EXTERNAL`
+
+### Lab DC Promotion: Blank Administrator Password
+
+**Symptom**: `Install-ADDSForest` fails with "the server must have a non-blank
+Administrator password to promote to a domain controller".
+
+The StefanScherer/windows_2019 Vagrant box ships with a blank local Administrator
+password. Windows Server requires a non-blank password before DC promotion.
+
+**Fix**: Set the password before promotion:
+
+```powershell
+net user Administrator "V@grant123!" /active:yes
+```
+
+Note: "vagrant" doesn't meet Windows complexity requirements. Use a password with
+uppercase, lowercase, number, and special character.
+
+### Shell Escaping: `!` in Passwords
+
+**Symptom**: LDAP authentication fails with `invalidCredentials` when using
+passwords containing `!` (like `Password123!`) from a bash/zsh shell.
+
+Both bash and zsh treat `!` as a history expansion character. Even in single quotes,
+some contexts still escape it as `\!`. The password sent to the tool becomes
+`Password123\!` instead of `Password123!`.
+
+**Fix**: Use `--password` without quotes, or escape properly:
+
+```bash
+# Works:
+python3 sidhistory.py -p Password123!
+
+# Also works (double quotes, escaped):
+python3 sidhistory.py -p "Password123\!"
+
+# BROKEN (single quotes in zsh may still escape):
+python3 sidhistory.py -p 'Password123!'
+```
+
+### Vagrant WinRM Timeout After DC Reboot
+
+**Symptom**: `vagrant up dc2` hangs indefinitely after DC promotion triggers a reboot.
+Vagrant waits for WinRM to come back but the DC takes too long to restart.
+
+AD DS promotion involves multiple reboots and can take 10-15 minutes on slow hardware.
+Vagrant's default WinRM timeout may not be sufficient.
+
+**Workaround**: If vagrant hangs, Ctrl+C and run the configure script manually:
+
+```bash
+# Option 1: Re-provision
+vagrant provision dc2 --provision-with configure-ad
+
+# Option 2: Use pywinrm from the host
+pip install pywinrm
+python3 -c "
+import winrm
+s = winrm.Session('http://192.168.56.11:5985/wsman',
+                   auth=('administrator@lab2.local', 'V@grant123!'),
+                   transport='ntlm')
+r = s.run_ps(open('lab/scripts/dc2-configure.ps1').read())
+print(r.std_out.decode())
+"
+```
+
+### Trust Desynchronization After Multiple Create/Delete Cycles
+
+**Symptom**: Trust operations fail with various errors after creating and deleting
+trusts multiple times. Passwords get desynchronized between the two DCs.
+
+Each side of a trust stores a Trusted Domain Object (TDO) with an independent copy
+of the trust password. Multiple create/delete cycles can leave orphaned TDOs or
+password mismatches.
+
+**Nuclear fix**: Delete ALL TDOs on both sides, then recreate atomically:
+
+```powershell
+# On each DC: find and delete all trust objects
+Get-ADObject -Filter 'objectClass -eq "trustedDomain"' -SearchBase "CN=System,DC=lab1,DC=local" |
+    Remove-ADObject -Recursive -Confirm:$false
+
+# Then recreate with .NET (see Forest Trust section above)
+```

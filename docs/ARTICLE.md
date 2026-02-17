@@ -516,6 +516,69 @@ schema-admins          → S-1-5-21-<domain>-518
 
 **NDR serialization hasn't been tested against every DC version.** The structures match the MS-DRSR spec exactly, but edge cases in NDR encoding could cause issues on specific Windows Server versions.
 
+**Not all DCs support opnum 20.** After DRSBind, check the server's `DRS_EXTENSIONS_INT.dwFlags` for `DRS_EXT_ADD_SID_HISTORY` (0x00040000). If this bit is missing, the DC does not implement `IDL_DRSAddSidHistory` and will return `ERROR_INVALID_FUNCTION`. We discovered this with Windows Server 2019 (StefanScherer Vagrant box) — the server flags `0x6d693a83` don't include the bit.
+
+---
+
+## The NDR Bugs: What No Documentation Tells You
+
+Building the NDR structures for opnum 20 produced two critical bugs that took significant
+debugging to resolve. Documenting them here because no one else has.
+
+### Bug 1: The Missing Union Discriminant
+
+The `pmsgIn` parameter is declared as:
+
+```c
+[in, ref, switch_is(dwInVersion)] DRS_MSG_ADDSIDREQ *pmsgIn
+```
+
+This is a **non-encapsulated NDR union**. The critical detail: in NDR wire format,
+a non-encapsulated union requires the discriminant value to appear **twice** on the wire —
+once as the actual parameter (`dwInVersion`), and once immediately before the union arm
+body as the union discriminant.
+
+```
+Wire format:
+  [hDrs: 20 bytes]
+  [dwInVersion: 01 00 00 00]      ← the parameter
+  [discriminant: 01 00 00 00]     ← the union tag (MUST be present!)
+  [V1 body: Flags, SrcDomain, ...]
+```
+
+impacket's `NDRCALL` framework handles *encapsulated* unions (where the discriminant
+is part of the union struct itself), but NOT the `switch_is()` pattern where the
+discriminant is a separate parameter in the call signature. This means
+`dce.request(request)` produces malformed NDR that's missing 4 bytes.
+
+The error? `rpc_x_bad_stub_data`. No indication of what's wrong. No offset. No field name.
+
+**Fix**: Build raw NDR bytes manually and use `dce.call(20, raw_bytes)` + `dce.recv()`.
+
+### Bug 2: Credential Fields Are NOT Strings
+
+The credential fields look like strings but have different NDR encoding:
+
+```c
+// These are [string] — encoded as LPWSTR (conformant varying array):
+[string] WCHAR *SrcDomain;
+[string] WCHAR *SrcPrincipal;
+
+// These are NOT [string] — encoded as conformant array (size_is only):
+[size_is(SrcCredsUserLength)] WCHAR *SrcCredsUser;
+```
+
+The difference in NDR encoding:
+- `LPWSTR` (`[string]`): `max_count` + `offset` (always 0) + `actual_count` + data
+- `[size_is(N)]` conformant array: `max_count` only + data
+
+Using `LPWSTR` for the credential fields adds extra bytes (offset + actual_count) that
+the server doesn't expect → `rpc_x_bad_stub_data` again.
+
+These two bugs produce the exact same error message, which made debugging extremely
+frustrating. The only way to diagnose them was to manually hex-dump the NDR bytes and
+compare against the MS-DRSR spec byte by byte.
+
 ---
 
 ## References

@@ -338,6 +338,30 @@ class LDAPOperations:
             logging.error(f"Error getting domain SID: {e}")
             return None
 
+    def get_name_by_sid(self, sid_string: str) -> Optional[str]:
+        """Resolve a SID string to a sAMAccountName via LDAP."""
+        try:
+            sid_bytes = self.sid_converter.string_to_bytes(sid_string)
+            escaped = ''.join(f'\\{b:02x}' for b in sid_bytes)
+            search_filter = f"(objectSid={escaped})"
+
+            self.connection.search(
+                search_base=self.base_dn,
+                search_filter=search_filter,
+                search_scope=SUBTREE,
+                attributes=['sAMAccountName'],
+                size_limit=1
+            )
+
+            if self.connection.entries:
+                return str(self.connection.entries[0].sAMAccountName)
+
+            return None
+
+        except Exception as e:
+            logging.debug(f"SID lookup failed for {sid_string}: {e}")
+            return None
+
     def enumerate_trusts(self) -> List[Dict[str, Any]]:
         """Enumerate domain trusts via LDAP."""
         trusts = []

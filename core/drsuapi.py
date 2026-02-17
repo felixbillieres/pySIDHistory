@@ -12,7 +12,6 @@ References:
 """
 
 import logging
-import struct
 from typing import Optional, Tuple
 
 try:
@@ -244,24 +243,19 @@ class DRSUAPIClient:
         """
         Call IDL_DRSAddSidHistory (opnum 20).
 
-        This is the cross-forest variant (flags=0) that:
-        - Looks up the source principal in the source domain
-        - Copies its objectSid + sIDHistory to the destination's sIDHistory
-        - Requires Domain Admin in dest, Admin in source
-
         Args:
-            src_domain: Source domain FQDN (must be in different forest)
+            src_domain: Source domain FQDN
             src_principal: Source principal sAMAccountName
             dst_domain: Destination domain FQDN
             dst_principal: Destination principal sAMAccountName
-            src_dc: Source DC hostname (optional, auto-discovered if omitted)
-            src_creds_user: Username for source domain auth (optional)
-            src_creds_domain: Domain for source domain auth (optional)
-            src_creds_password: Password for source domain auth (optional)
-            flags: DRS_ADDSID_FLAGS (0 for cross-forest, or DEL_SRC_OBJ for same-domain)
+            src_dc: Source DC hostname (optional, auto-discovered)
+            src_creds_user: Username for source domain auth
+            src_creds_domain: Domain for source domain auth
+            src_creds_password: Password for source domain auth
+            flags: DRS_ADDSID_FLAGS (0=cross-forest, DEL_SRC_OBJ=same-domain)
 
         Returns:
-            Tuple of (success: bool, win32_error: int, error_message: str)
+            Tuple of (success, win32_error, error_message)
         """
         if not self._hDrs:
             return False, -1, "Not connected (DRSBind required)"
@@ -315,8 +309,8 @@ class DRSUAPIClient:
                         f"{dst_principal}@{dst_domain}")
 
             resp = self._dce.request(request)
-
             win32_error = resp['pmsgOut']['V1']['dwWin32Error']
+
             if win32_error == 0:
                 logging.info("DRSAddSidHistory succeeded!")
                 return True, 0, "Success"
@@ -329,12 +323,8 @@ class DRSUAPIClient:
             error_str = str(e)
             logging.error(f"DRSAddSidHistory RPC error: {error_str}")
 
-            # Try to extract meaningful error from RPC fault
             if 'rpc_s_access_denied' in error_str.lower():
                 return False, 5, "Access denied - Domain Admin privileges required"
-            elif 'ERROR_DS_MUST_RUN_ON_DST_DC' in error_str:
-                return False, 8547, ("Must run on destination DC - connect to the DC "
-                                    "that holds the destination domain's NC")
 
             return False, -1, error_str
 
@@ -343,54 +333,18 @@ class DRSUAPIClient:
         Same-domain SID History injection using DS_ADDSID_FLAG_PRIVATE_DEL_SRC_OBJ.
 
         WARNING: This DELETES the source object and copies its SID(s) to the destination.
-        Use with extreme caution. Principals are identified by DN, not sAMAccountName.
-
-        Args:
-            src_dn: DN of source principal (will be DELETED)
-            dst_dn: DN of destination principal
-
-        Returns:
-            Tuple of (success, win32_error, error_message)
         """
         if not self._hDrs:
             return False, -1, "Not connected (DRSBind required)"
 
-        try:
-            request = DRSAddSidHistory()
-            request['hDrs'] = self._hDrs
-            request['dwInVersion'] = 1
-            request['pmsgIn']['tag'] = 1
+        logging.info(f"Calling DRSAddSidHistory (DEL_SRC_OBJ): {src_dn} -> {dst_dn}")
+        logging.warning("This will DELETE the source object!")
 
-            v1 = request['pmsgIn']['V1']
-            v1['Flags'] = DS_ADDSID_FLAG_PRIVATE_DEL_SRC_OBJ
-            v1['SrcDomain'] = self.domain + '\x00'
-            v1['SrcPrincipal'] = src_dn + '\x00'
-            v1['SrcDomainController'] = NULL
-            v1['SrcCredsUserLength'] = 0
-            v1['SrcCredsUser'] = NULL
-            v1['SrcCredsDomainLength'] = 0
-            v1['SrcCredsDomain'] = NULL
-            v1['SrcCredsPasswordLength'] = 0
-            v1['SrcCredsPassword'] = NULL
-            v1['DstDomain'] = self.domain + '\x00'
-            v1['DstPrincipal'] = dst_dn + '\x00'
-
-            logging.info(f"Calling DRSAddSidHistory (DEL_SRC_OBJ): {src_dn} -> {dst_dn}")
-            logging.warning("This will DELETE the source object!")
-
-            resp = self._dce.request(request)
-            win32_error = resp['pmsgOut']['V1']['dwWin32Error']
-
-            if win32_error == 0:
-                logging.info("DRSAddSidHistory (DEL_SRC_OBJ) succeeded!")
-                return True, 0, "Success - source object deleted"
-            else:
-                error_msg = self._translate_win32_error(win32_error)
-                logging.error(f"DRSAddSidHistory failed: {error_msg}")
-                return False, win32_error, error_msg
-
-        except Exception as e:
-            return False, -1, str(e)
+        return self.add_sid_history(
+            src_domain=self.domain, src_principal=src_dn,
+            dst_domain=self.domain, dst_principal=dst_dn,
+            flags=DS_ADDSID_FLAG_PRIVATE_DEL_SRC_OBJ
+        )
 
     def disconnect(self):
         """Unbind and disconnect from DRSUAPI."""
