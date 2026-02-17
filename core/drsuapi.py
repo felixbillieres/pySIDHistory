@@ -17,7 +17,7 @@ from typing import Optional, Tuple
 
 try:
     from impacket.dcerpc.v5 import drsuapi, transport, epm
-    from impacket.dcerpc.v5.ndr import NDRCALL, NDRSTRUCT, NDRPOINTER, NULL
+    from impacket.dcerpc.v5.ndr import NDRCALL, NDRSTRUCT, NDRPOINTER, NDRUNION, NULL
     from impacket.dcerpc.v5.dtypes import (
         DWORD, LPWSTR, ULONG, WSTR, LONG, NDRPOINTERNULL
     )
@@ -88,18 +88,34 @@ if HAS_IMPACKET:
             ('dwWin32Error', DWORD),
         )
 
+    class DRS_MSG_ADDSIDREQ(NDRUNION):
+        commonHdr = (
+            ('tag', DWORD),
+        )
+        union = {
+            1: ('V1', DRS_MSG_ADDSIDREQ_V1),
+        }
+
+    class DRS_MSG_ADDSIDREPLY(NDRUNION):
+        commonHdr = (
+            ('tag', DWORD),
+        )
+        union = {
+            1: ('V1', DRS_MSG_ADDSIDREPLY_V1),
+        }
+
     class DRSAddSidHistory(NDRCALL):
         opnum = 20
         structure = (
             ('hDrs', drsuapi.DRS_HANDLE),
             ('dwInVersion', DWORD),
-            ('pmsgIn', DRS_MSG_ADDSIDREQ_V1),
+            ('pmsgIn', DRS_MSG_ADDSIDREQ),
         )
 
     class DRSAddSidHistoryResponse(NDRCALL):
         structure = (
             ('pdwOutVersion', DWORD),
-            ('pmsgOut', DRS_MSG_ADDSIDREPLY_V1),
+            ('pmsgOut', DRS_MSG_ADDSIDREPLY),
             ('ErrorCode', DWORD),
         )
 
@@ -253,49 +269,50 @@ class DRSUAPIClient:
             request = DRSAddSidHistory()
             request['hDrs'] = self._hDrs
             request['dwInVersion'] = 1
+            request['pmsgIn']['tag'] = 1
 
-            # Fill V1 structure
-            request['pmsgIn']['Flags'] = flags
-            request['pmsgIn']['SrcDomain'] = src_domain + '\x00'
-            request['pmsgIn']['SrcPrincipal'] = src_principal + '\x00'
+            # Fill V1 structure via union
+            v1 = request['pmsgIn']['V1']
+            v1['Flags'] = flags
+            v1['SrcDomain'] = src_domain + '\x00'
+            v1['SrcPrincipal'] = src_principal + '\x00'
 
             if src_dc:
-                request['pmsgIn']['SrcDomainController'] = src_dc + '\x00'
+                v1['SrcDomainController'] = src_dc + '\x00'
             else:
-                request['pmsgIn']['SrcDomainController'] = NULL
+                v1['SrcDomainController'] = NULL
 
             # Source credentials
             if src_creds_user:
-                encoded_user = src_creds_user.encode('utf-16-le')
-                request['pmsgIn']['SrcCredsUserLength'] = len(src_creds_user)
-                request['pmsgIn']['SrcCredsUser'] = src_creds_user + '\x00'
+                v1['SrcCredsUserLength'] = len(src_creds_user)
+                v1['SrcCredsUser'] = src_creds_user + '\x00'
             else:
-                request['pmsgIn']['SrcCredsUserLength'] = 0
-                request['pmsgIn']['SrcCredsUser'] = NULL
+                v1['SrcCredsUserLength'] = 0
+                v1['SrcCredsUser'] = NULL
 
             if src_creds_domain:
-                request['pmsgIn']['SrcCredsDomainLength'] = len(src_creds_domain)
-                request['pmsgIn']['SrcCredsDomain'] = src_creds_domain + '\x00'
+                v1['SrcCredsDomainLength'] = len(src_creds_domain)
+                v1['SrcCredsDomain'] = src_creds_domain + '\x00'
             else:
-                request['pmsgIn']['SrcCredsDomainLength'] = 0
-                request['pmsgIn']['SrcCredsDomain'] = NULL
+                v1['SrcCredsDomainLength'] = 0
+                v1['SrcCredsDomain'] = NULL
 
             if src_creds_password:
-                request['pmsgIn']['SrcCredsPasswordLength'] = len(src_creds_password)
-                request['pmsgIn']['SrcCredsPassword'] = src_creds_password + '\x00'
+                v1['SrcCredsPasswordLength'] = len(src_creds_password)
+                v1['SrcCredsPassword'] = src_creds_password + '\x00'
             else:
-                request['pmsgIn']['SrcCredsPasswordLength'] = 0
-                request['pmsgIn']['SrcCredsPassword'] = NULL
+                v1['SrcCredsPasswordLength'] = 0
+                v1['SrcCredsPassword'] = NULL
 
-            request['pmsgIn']['DstDomain'] = dst_domain + '\x00'
-            request['pmsgIn']['DstPrincipal'] = dst_principal + '\x00'
+            v1['DstDomain'] = dst_domain + '\x00'
+            v1['DstPrincipal'] = dst_principal + '\x00'
 
             logging.info(f"Calling DRSAddSidHistory: {src_principal}@{src_domain} -> "
                         f"{dst_principal}@{dst_domain}")
 
             resp = self._dce.request(request)
 
-            win32_error = resp['pmsgOut']['dwWin32Error']
+            win32_error = resp['pmsgOut']['V1']['dwWin32Error']
             if win32_error == 0:
                 logging.info("DRSAddSidHistory succeeded!")
                 return True, 0, "Success"
@@ -338,25 +355,27 @@ class DRSUAPIClient:
             request = DRSAddSidHistory()
             request['hDrs'] = self._hDrs
             request['dwInVersion'] = 1
+            request['pmsgIn']['tag'] = 1
 
-            request['pmsgIn']['Flags'] = DS_ADDSID_FLAG_PRIVATE_DEL_SRC_OBJ
-            request['pmsgIn']['SrcDomain'] = self.domain + '\x00'
-            request['pmsgIn']['SrcPrincipal'] = src_dn + '\x00'
-            request['pmsgIn']['SrcDomainController'] = NULL
-            request['pmsgIn']['SrcCredsUserLength'] = 0
-            request['pmsgIn']['SrcCredsUser'] = NULL
-            request['pmsgIn']['SrcCredsDomainLength'] = 0
-            request['pmsgIn']['SrcCredsDomain'] = NULL
-            request['pmsgIn']['SrcCredsPasswordLength'] = 0
-            request['pmsgIn']['SrcCredsPassword'] = NULL
-            request['pmsgIn']['DstDomain'] = self.domain + '\x00'
-            request['pmsgIn']['DstPrincipal'] = dst_dn + '\x00'
+            v1 = request['pmsgIn']['V1']
+            v1['Flags'] = DS_ADDSID_FLAG_PRIVATE_DEL_SRC_OBJ
+            v1['SrcDomain'] = self.domain + '\x00'
+            v1['SrcPrincipal'] = src_dn + '\x00'
+            v1['SrcDomainController'] = NULL
+            v1['SrcCredsUserLength'] = 0
+            v1['SrcCredsUser'] = NULL
+            v1['SrcCredsDomainLength'] = 0
+            v1['SrcCredsDomain'] = NULL
+            v1['SrcCredsPasswordLength'] = 0
+            v1['SrcCredsPassword'] = NULL
+            v1['DstDomain'] = self.domain + '\x00'
+            v1['DstPrincipal'] = dst_dn + '\x00'
 
             logging.info(f"Calling DRSAddSidHistory (DEL_SRC_OBJ): {src_dn} -> {dst_dn}")
             logging.warning("This will DELETE the source object!")
 
             resp = self._dce.request(request)
-            win32_error = resp['pmsgOut']['dwWin32Error']
+            win32_error = resp['pmsgOut']['V1']['dwWin32Error']
 
             if win32_error == 0:
                 logging.info("DRSAddSidHistory (DEL_SRC_OBJ) succeeded!")

