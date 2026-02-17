@@ -7,7 +7,7 @@ Supports users, groups, and computer objects with paged searches.
 import logging
 from typing import Optional, List, Dict, Any
 from ldap3 import (
-    Connection, MODIFY_REPLACE, MODIFY_ADD, MODIFY_DELETE, SUBTREE,
+    Connection, MODIFY_DELETE, SUBTREE,
     ALL_ATTRIBUTES
 )
 from ldap3.core.exceptions import LDAPException
@@ -175,57 +175,6 @@ class LDAPOperations:
             return [self.sid_converter.bytes_to_string(b) for b in raw_values]
         except Exception:
             return []
-
-    def modify_sid_history(self, user_dn: str, sid_list: List[str]) -> bool:
-        """Replace the entire SID History attribute."""
-        try:
-            sid_bytes_list = []
-            for sid in sid_list:
-                sid_bytes = self.sid_converter.string_to_bytes(sid)
-                if not sid_bytes:
-                    logging.error(f"Failed to convert SID {sid} to bytes")
-                    return False
-                sid_bytes_list.append(sid_bytes)
-
-            changes = {'sIDHistory': [(MODIFY_REPLACE, sid_bytes_list)]}
-            success = self.connection.modify(user_dn, changes)
-
-            if success:
-                logging.info(f"Successfully modified SID History for {user_dn}")
-                return True
-            else:
-                result = self.connection.result
-                logging.error(f"Failed to modify SID History: {result}")
-                self._log_modify_error_hint(result)
-                return False
-
-        except LDAPException as e:
-            logging.error(f"Error modifying SID History: {e}")
-            return False
-
-    def add_sid_to_history(self, user_dn: str, sid_string: str) -> bool:
-        """Add a single SID to sIDHistory using MODIFY_ADD."""
-        try:
-            sid_bytes = self.sid_converter.string_to_bytes(sid_string)
-            if not sid_bytes:
-                logging.error(f"Failed to convert SID {sid_string} to bytes")
-                return False
-
-            changes = {'sIDHistory': [(MODIFY_ADD, [sid_bytes])]}
-            success = self.connection.modify(user_dn, changes)
-
-            if success:
-                logging.info(f"Successfully added SID to history for {user_dn}")
-                return True
-            else:
-                result = self.connection.result
-                logging.error(f"Failed to add SID to history: {result}")
-                self._log_modify_error_hint(result)
-                return False
-
-        except LDAPException as e:
-            logging.error(f"Error adding SID to history: {e}")
-            return False
 
     def remove_sid_from_history(self, user_dn: str, sid_string: str) -> bool:
         """Remove a single SID from sIDHistory using MODIFY_DELETE."""
@@ -579,21 +528,3 @@ class LDAPOperations:
 
         return flags
 
-    @staticmethod
-    def _log_modify_error_hint(result: dict):
-        """Log hints for common sIDHistory modification errors."""
-        description = str(result.get('description', ''))
-        message = str(result.get('message', ''))
-
-        if 'insufficientAccessRights' in description or '00002098' in message:
-            logging.error("Hint: sIDHistory modification requires 'Write sIDHistory' "
-                         "control access right (or Domain Admin privileges)")
-            logging.error("Hint: Direct LDAP ADD to sIDHistory is blocked on most DCs.")
-            logging.error("Hint: Consider using --method drsuapi for RPC-based injection")
-        elif 'unwillingToPerform' in description or '0000209A' in message:
-            logging.error("Hint: The DC refused the operation. Common causes:")
-            logging.error("  - sIDHistory cannot be added via LDAP (use --method drsuapi)")
-            logging.error("  - SID Filtering (quarantine) is enabled on the trust")
-            logging.error("  - The SID belongs to a well-known/protected group")
-        elif 'constraintViolation' in description:
-            logging.error("Hint: Constraint violation - the SID may already exist or be invalid")
