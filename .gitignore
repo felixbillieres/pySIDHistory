@@ -139,3 +139,8 @@ EXAMPLES.md
 FEATURES.md
 TECHNICAL.md
 
+# Lab runtime (keep Vagrantfile + scripts, ignore state)
+lab/.vagrant/
+docs/pictures/
+todo.md
+

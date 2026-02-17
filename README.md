@@ -32,17 +32,6 @@ python3 sidhistory.py -d DST.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
 
 ![DRSUAPI cross-forest injection](docs/drsuapi_injection.png)
 
-### Dry Run
-
-Preview what would be injected without modifying AD.
-
-```bash
-python3 sidhistory.py -d DST.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
-    --target victim --source-user admin --source-domain SRC.LOCAL --dry-run
-```
-
-![Dry run](docs/dry_run.png)
-
 ---
 
 ## Blue Team — Audit & Cleanup
@@ -168,6 +157,35 @@ python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
 | Kerberos | `--kerberos --ccache ticket.ccache` | ldap3 SASL/GSSAPI |
 | Certificate (PTC) | `--certificate --cert-file X --key-file Y` | LDAPS + SASL EXTERNAL |
 | SIMPLE bind | `--simple -u admin -p Pass123 --use-ssl` | ldap3 SIMPLE |
+
+---
+
+## Lab Environment
+
+A fully automated Vagrant lab is included for testing. 2 Windows Server 2019 DCs with a cross-forest trust.
+
+```bash
+cd lab/
+
+# Deploy (sequential — DC1 must be up before DC2)
+vagrant up dc1        # ~15 min
+vagrant up dc2        # ~15 min
+
+# Establish the forest trust
+vagrant winrm dc1 -c "powershell -File C:\vagrant\scripts\setup-trust.ps1"
+
+# Enable auditing + audit groups (required for DRSAddSidHistory)
+cd .. && ./lab/rollback.sh --all
+```
+
+| Machine | Domain | IP | User | Password |
+|---------|--------|----|------|----------|
+| DC1 | lab1.local | 192.168.56.10 | da-admin | Password123! |
+| DC2 | lab2.local | 192.168.56.11 | da-admin2 | Password123! |
+
+**Requirements**: VirtualBox 6.1+, Vagrant 2.3+, ~4.5 GB RAM, ~40 GB disk
+
+See [`lab/README.md`](lab/README.md) for full setup instructions, credentials, and troubleshooting.
 
 ---
 

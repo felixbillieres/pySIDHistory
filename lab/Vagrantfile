@@ -1,0 +1,73 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#
+# pySIDHistory Minimal Lab
+# 2 Windows Server 2019 DCs, 2 forests, 1 forest trust
+# Total: ~4.5GB RAM
+#
+# Network: 192.168.56.0/24 (VirtualBox host-only)
+#   DC1 (lab1.local)  -> 192.168.56.10
+#   DC2 (lab2.local)  -> 192.168.56.11
+#   Host (attackbox)   -> 192.168.56.1
+
+Vagrant.configure("2") do |config|
+
+  # ── DC1: lab1.local (First Forest) ─────────────────────────────────
+  config.vm.define "dc1" do |dc1|
+    dc1.vm.box = "StefanScherer/windows_2019"
+    dc1.vm.hostname = "DC1"
+    dc1.vm.network "private_network", ip: "192.168.56.10", virtualbox__intnet: false
+    dc1.vm.communicator = "winrm"
+    dc1.winrm.transport = :plaintext
+    dc1.winrm.basic_auth_only = true
+
+    dc1.vm.provider "virtualbox" do |vb|
+      vb.name = "pySIDHistory-DC1"
+      vb.memory = 2560
+      vb.cpus = 2
+      vb.gui = false
+      vb.customize ["modifyvm", :id, "--clipboard-mode", "bidirectional"]
+    end
+
+    # Phase 1: Install AD DS and promote to DC
+    dc1.vm.provision "shell", name: "install-adds",
+      path: "scripts/dc1-install.ps1",
+      privileged: true,
+      reboot: true
+
+    # Phase 2: Configure users, groups, DNS
+    dc1.vm.provision "shell", name: "configure-ad",
+      path: "scripts/dc1-configure.ps1",
+      privileged: true
+  end
+
+  # ── DC2: lab2.local (Second Forest) ────────────────────────────────
+  config.vm.define "dc2" do |dc2|
+    dc2.vm.box = "StefanScherer/windows_2019"
+    dc2.vm.hostname = "DC2"
+    dc2.vm.network "private_network", ip: "192.168.56.11", virtualbox__intnet: false
+    dc2.vm.communicator = "winrm"
+    dc2.winrm.transport = :plaintext
+    dc2.winrm.basic_auth_only = true
+
+    dc2.vm.provider "virtualbox" do |vb|
+      vb.name = "pySIDHistory-DC2"
+      vb.memory = 2048
+      vb.cpus = 2
+      vb.gui = false
+      vb.customize ["modifyvm", :id, "--clipboard-mode", "bidirectional"]
+    end
+
+    # Phase 1: Install AD DS and promote to DC
+    dc2.vm.provision "shell", name: "install-adds",
+      path: "scripts/dc2-install.ps1",
+      privileged: true,
+      reboot: true
+
+    # Phase 2: Configure users, groups, DNS
+    dc2.vm.provision "shell", name: "configure-ad",
+      path: "scripts/dc2-configure.ps1",
+      privileged: true
+  end
+
+end
