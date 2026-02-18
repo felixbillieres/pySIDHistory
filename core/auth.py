@@ -90,7 +90,7 @@ class AuthenticationManager:
 
                 self._username = username
                 self._password = password
-                logging.info(f"Successfully authenticated via NTLM as {username}")
+                logging.debug(f"Successfully authenticated via NTLM as {username}")
                 return connection
 
             except Exception as e:
@@ -140,7 +140,7 @@ class AuthenticationManager:
 
             imp_conn = imp_ldap.LDAPConnection(url, base_dn)
             imp_conn.login(username, '', self.domain, lm_hash, nt_hash)
-            logging.info(f"impacket PTH succeeded as {username}")
+            logging.debug(f"impacket PTH succeeded as {username}")
 
             # Now create ldap3 connection using the authenticated credentials
             # ldap3 should work with the hash as password for subsequent ops
@@ -156,7 +156,7 @@ class AuthenticationManager:
                 auto_bind=True
             )
 
-            logging.info(f"Successfully authenticated via Pass-the-Hash as {username}")
+            logging.debug(f"Successfully authenticated via Pass-the-Hash as {username}")
             return connection
 
         except ImportError:
@@ -182,7 +182,7 @@ class AuthenticationManager:
                 auto_bind=True
             )
 
-            logging.info(f"Successfully authenticated via PTH (ldap3 fallback) as {username}")
+            logging.debug(f"Successfully authenticated via PTH (ldap3 fallback) as {username}")
             return connection
 
         except Exception as e:
@@ -207,7 +207,7 @@ class AuthenticationManager:
                 auto_bind=True
             )
 
-            logging.info("Successfully authenticated via Kerberos")
+            logging.debug("Successfully authenticated via Kerberos")
             return connection
 
         except Exception as e:
@@ -243,7 +243,7 @@ class AuthenticationManager:
                     auto_bind=True
                 )
 
-            logging.info("Successfully authenticated via client certificate")
+            logging.debug("Successfully authenticated via client certificate")
             return connection
 
         except Exception as e:
@@ -275,7 +275,7 @@ class AuthenticationManager:
                 auto_bind=True
             )
 
-            logging.info(f"Successfully authenticated via SIMPLE as {username}")
+            logging.debug(f"Successfully authenticated via SIMPLE as {username}")
             return connection
 
         except Exception as e:

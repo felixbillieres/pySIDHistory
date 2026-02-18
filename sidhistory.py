@@ -5,8 +5,8 @@ pySIDHistory - Remote SID History Attack & Audit Tool
 The first tool to perform SID History injection from a distant
 UNIX-like machine, combining LDAP and DRSUAPI (MS-DRSR opnum 20).
 
-Author: Felix Billieres (Elliot Belt)
-License: MIT - For authorized security testing only.
+Author: @felixbillieres
+License: MIT
 """
 
 import argparse
@@ -19,25 +19,25 @@ from core.output import OutputFormatter
 
 
 BANNER = r"""
-             _____ _____ ____  _   _ _     _
- _ __  _   _/ ____|_   _|  _ \| | | (_)___| |_ ___  _ __ _   _
-| '_ \| | | \___ \  | | | | | | |_| | / __| __/ _ \| '__| | | |
-| |_) | |_| |___) | | | | |_| |  _  | \__ \ || (_) | |  | |_| |
-| .__/ \__, |____/ |___|____/|_| |_|_|___/\__\___/|_|   \__, |
-|_|    |___/                                              |___/
+             _____  _____ ____  _   _ _     _
+ _ __  _   _/ ____| |_ _||  _ \| | | (_)___| |_ ___  _ __ _   _
+| '_ \| | | \___ \   | | | | | | |_| | / __| __/ _ \| '__| | | |
+| |_) | |_| |___) |  | | | |_| |  _  | \__ \ || (_) | |  | |_| |
+| .__/ \__, |____/  |___| |____/|_| |_|_|___/\__\___/|_|   \__, |
+|_|    |___/                                                |___/
         Remote SID History Attack & Audit Tool
-        MITRE ATT&CK T1134.005 | For authorized testing only
+                                        @felixbillieres
 """
 
 
 def setup_logging(verbose: bool = False, quiet: bool = False):
     """Configure logging."""
     if quiet:
-        level = logging.WARNING
+        level = logging.CRITICAL
     elif verbose:
         level = logging.DEBUG
     else:
-        level = logging.INFO
+        level = logging.WARNING
 
     logging.basicConfig(
         level=level,

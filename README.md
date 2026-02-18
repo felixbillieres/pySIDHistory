@@ -4,8 +4,6 @@ Remote SID History injection & auditing from Linux — the first tool to impleme
 
 > *"There is currently no way to exploit this technique purely from a distant UNIX-like machine"* — [The Hacker Recipes](https://www.thehacker.recipes/ad/persistence/sid-history)
 
-**MITRE ATT&CK**: [T1134.005 — SID-History Injection](https://attack.mitre.org/techniques/T1134/005/)
-
 ## Installation
 
 ```bash
@@ -185,14 +183,9 @@ Monitor for 4765/4766 — these are specific to SID History and should be extrem
 ## References
 
 - [MS-DRSR: IDL_DRSAddSidHistory (Opnum 20)](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-drsr/376230a5-d806-4ae5-970a-f6243ee193c8)
-- [MITRE ATT&CK T1134.005](https://attack.mitre.org/techniques/T1134/005/)
 - [The Hacker Recipes: SID History](https://www.thehacker.recipes/ad/persistence/sid-history)
 - [impacket](https://github.com/fortra/impacket)
 
 ## Author
 
-**Felix Billieres (Elliot Belt)**
-
-## Legal
-
-**For authorized security testing only.** Unauthorized access to computer systems is illegal. Use at your own risk on systems you have explicit permission to test.
+[@felixbillieres](https://github.com/felixbillieres)

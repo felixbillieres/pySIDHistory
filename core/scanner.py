@@ -61,7 +61,7 @@ class DomainScanner:
         Returns:
             AuditReport with all findings
         """
-        logging.info("Starting full domain sIDHistory audit...")
+        logging.debug("Starting full domain sIDHistory audit...")
 
         # Get domain SID
         self.domain_sid = self.ldap_ops.get_domain_sid()
@@ -74,7 +74,7 @@ class DomainScanner:
         )
 
         # Scan for all objects with sIDHistory
-        logging.info("Scanning for objects with sIDHistory...")
+        logging.debug("Scanning for objects with sIDHistory...")
         objects = self.ldap_ops.find_all_with_sid_history()
         report.total_objects_scanned = len(objects)
 
@@ -85,13 +85,13 @@ class DomainScanner:
                 report.objects_with_sid_history += 1
 
         # Enumerate trusts
-        logging.info("Enumerating domain trusts...")
+        logging.debug("Enumerating domain trusts...")
         report.trusts = self.ldap_ops.enumerate_trusts()
 
         # Build summary
         report.summary = self._build_summary(report)
 
-        logging.info(f"Audit complete: {report.objects_with_sid_history} objects "
+        logging.debug(f"Audit complete: {report.objects_with_sid_history} objects "
                     f"with sIDHistory found")
         return report
 

