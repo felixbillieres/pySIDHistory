@@ -118,30 +118,9 @@ python3 sidhistory.py -d $DOMAIN -u $USER -p '$PASSWORD' --dc-ip $DC_IP \
 
 ## Lab Environment
 
-A fully automated Vagrant lab is included for testing. 2 Windows Server 2019 DCs with a cross-forest trust.
+A fully automated Vagrant lab is available for testing — 2 Windows Server 2019 DCs with a cross-forest trust, pre-configured with all DRSAddSidHistory prerequisites.
 
-```bash
-cd lab/
-
-# Deploy (sequential — DC1 must be up before DC2)
-vagrant up dc1        # ~15 min
-vagrant up dc2        # ~15 min
-
-# Establish the forest trust
-vagrant winrm dc1 -c "powershell -File C:\vagrant\scripts\setup-trust.ps1"
-
-# Enable auditing + audit groups (required for DRSAddSidHistory)
-cd .. && ./lab/rollback.sh --all
-```
-
-| Machine | Domain | IP | User | Password |
-|---------|--------|----|------|----------|
-| DC1 | lab1.local | 192.168.56.10 | da-admin | Password123! |
-| DC2 | lab2.local | 192.168.56.11 | da-admin2 | Password123! |
-
-**Requirements**: VirtualBox 6.1+, Vagrant 2.3+, ~4.5 GB RAM, ~40 GB disk
-
-See [`lab/README.md`](lab/README.md) for full setup instructions, credentials, and troubleshooting.
+**[sIDHistoryLab](https://github.com/felixbillieres/sIDHistoryLab)** — Setup instructions, credentials, and troubleshooting.
 
 ---
 
