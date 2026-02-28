@@ -5,6 +5,7 @@ Handles AP-REQ decryption, AP-REP construction, and GSS-API wrap/unwrap
 for both CFX (AES, RFC 4121) and legacy (RC4, RFC 1964) formats.
 """
 
+import logging
 import struct
 import os
 import hashlib
@@ -101,8 +102,8 @@ class KerberosUtils:
             plain_ticket, asn1Spec=krb5_asn1.EncTicketPart()
         )
 
-        session_key_bytes = bytes(enc_ticket_part['key']['keyvalue'])
-        session_key_etype = int(enc_ticket_part['key']['keytype'])
+        ticket_session_key = bytes(enc_ticket_part['key']['keyvalue'])
+        ticket_session_etype = int(enc_ticket_part['key']['keytype'])
 
         # Decrypt authenticator (key usage 11)
         auth_enc = ap_req['authenticator']
@@ -110,13 +111,13 @@ class KerberosUtils:
         auth_cipher = bytes(auth_enc['cipher'])
 
         auth_enc_cls = _enctype_table[auth_etype]
-        session_key_obj = Key(session_key_etype, session_key_bytes)
+        session_key_obj = Key(ticket_session_etype, ticket_session_key)
 
         plain_auth = auth_enc_cls.decrypt(
             session_key_obj, KU_AUTHENTICATOR_DECRYPT, auth_cipher
         )
 
-        # Parse Authenticator to get seq-number
+        # Parse Authenticator to get seq-number and subkey
         authenticator, _ = asn1_decoder.decode(
             plain_auth, asn1Spec=krb5_asn1.Authenticator()
         )
@@ -126,17 +127,51 @@ class KerberosUtils:
         except Exception:
             pass
 
-        return session_key_bytes, session_key_etype, seq_number
+        # Extract ctime/cusec from Authenticator (needed for AP-REP)
+        ctime = None
+        cusec = 0
+        try:
+            ctime = str(authenticator['ctime'])
+            cusec = int(authenticator['cusec'])
+        except Exception:
+            pass
+
+        # RFC 4121: if the client provides a subkey in the Authenticator,
+        # it MUST be used as the session encryption key for GSS operations.
+        # The subkey is used for GSS wrap/unwrap, but AP-REP is still
+        # encrypted with the ticket session key.
+        gss_key_bytes = ticket_session_key
+        gss_key_etype = ticket_session_etype
+        try:
+            subkey = authenticator['subkey']
+            if subkey.hasValue() and subkey['keyvalue'].hasValue():
+                gss_key_bytes = bytes(subkey['keyvalue'])
+                gss_key_etype = int(subkey['keytype'])
+                logging.debug(f"Using Authenticator subkey (etype={gss_key_etype})")
+        except Exception:
+            pass  # No subkey — use ticket session key for everything
+
+        return (ticket_session_key, ticket_session_etype,
+                gss_key_bytes, gss_key_etype,
+                seq_number, ctime, cusec)
 
     @staticmethod
     def build_ap_rep(session_key_bytes: bytes, session_key_etype: int,
-                     seq_number: int = 0) -> bytes:
-        """Build AP-REP response."""
+                     seq_number: int = 0,
+                     ctime: str = None, cusec: int = 0) -> bytes:
+        """Build AP-REP response.
+
+        The ctime/cusec should be echoed from the client's Authenticator
+        to prove the server received and decrypted it.
+        """
         # Build EncAPRepPart
         enc_ap_rep = krb5_asn1.EncAPRepPart()
-        now = datetime.now(timezone.utc)
-        enc_ap_rep['ctime'] = now.strftime('%Y%m%d%H%M%SZ')
-        enc_ap_rep['cusec'] = now.microsecond
+        if ctime:
+            enc_ap_rep['ctime'] = ctime
+        else:
+            now = datetime.now(timezone.utc)
+            enc_ap_rep['ctime'] = now.strftime('%Y%m%d%H%M%SZ')
+        enc_ap_rep['cusec'] = cusec
         enc_ap_rep['seq-number'] = seq_number
 
         # Encrypt with session key (key usage 12)

