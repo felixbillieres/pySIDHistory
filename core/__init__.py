@@ -1,5 +1,5 @@
 """
-pySIDHistory - Core Module
+pySIDHistory v2 - Core Module
 """
 
 from .attack import SIDHistoryAttack
@@ -8,6 +8,7 @@ from .sid_utils import SIDConverter
 from .ldap_operations import LDAPOperations
 from .scanner import DomainScanner
 from .output import OutputFormatter
+from .injection import DSInternalsInjector
 
 __all__ = [
     'SIDHistoryAttack',
@@ -16,4 +17,5 @@ __all__ = [
     'LDAPOperations',
     'DomainScanner',
     'OutputFormatter',
+    'DSInternalsInjector',
 ]

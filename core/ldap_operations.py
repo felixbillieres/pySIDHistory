@@ -12,7 +12,6 @@ from ldap3 import (
 )
 from ldap3.core.exceptions import LDAPException
 from ldap3.utils.conv import escape_filter_chars
-from ldap3.extend.microsoft.addMembersToGroups import ad_add_members_to_groups
 
 from .sid_utils import SIDConverter
 

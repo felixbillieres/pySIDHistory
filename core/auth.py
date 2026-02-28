@@ -41,6 +41,8 @@ class AuthenticationManager:
         self._nt_hash = ''
         self._do_kerberos = False
         self._aes_key = ''
+        self._last_auth_method = None
+        self._last_auth_params = {}
 
     @property
     def credentials(self):
@@ -287,6 +289,12 @@ class AuthenticationManager:
                       use_ssl: bool = False, ccache_path: Optional[str] = None,
                       cert_file: Optional[str] = None, key_file: Optional[str] = None) -> Optional[Connection]:
         """Get connection using specified authentication method."""
+        self._last_auth_method = auth_method
+        self._last_auth_params = {
+            'username': username, 'password': password, 'nt_hash': nt_hash,
+            'use_ssl': use_ssl, 'ccache_path': ccache_path,
+            'cert_file': cert_file, 'key_file': key_file,
+        }
         if auth_method == self.AUTH_NTLM:
             return self.connect_ntlm(username, password, use_ssl)
         elif auth_method == self.AUTH_NTLM_HASH:

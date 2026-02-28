@@ -259,12 +259,10 @@ class SIDConverter:
         if sid_string in WELL_KNOWN_SIDS:
             return WELL_KNOWN_SIDS[sid_string]
 
-        # Check domain-relative RIDs
+        # Check domain-relative RIDs (resolve even for foreign domains)
         rid = SIDConverter.extract_rid(sid_string)
         if rid is not None and rid in WELL_KNOWN_RIDS:
-            sid_domain = SIDConverter.extract_domain_sid(sid_string)
-            if sid_domain and (domain_sid is None or sid_domain == domain_sid):
-                return WELL_KNOWN_RIDS[rid]
+            return WELL_KNOWN_RIDS[rid]
 
         return sid_string
 
