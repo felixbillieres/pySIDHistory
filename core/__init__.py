@@ -8,7 +8,7 @@ from .sid_utils import SIDConverter
 from .ldap_operations import LDAPOperations
 from .scanner import DomainScanner
 from .output import OutputFormatter
-from .injection import DSInternalsInjector
+from .methods.dsinternals import DSInternalsInjector
 
 __all__ = [
     'SIDHistoryAttack',

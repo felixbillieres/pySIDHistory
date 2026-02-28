@@ -1,6 +1,6 @@
 # pySIDHistory
 
-Remote SID History injection & auditing from Linux — two injection methods, full audit toolkit, one command.
+Remote SID History injection & auditing from Linux — three injection methods, full audit toolkit, one command.
 
 > *"There is currently no way to exploit this technique purely from a distant UNIX-like machine"* — [The Hacker Recipes](https://www.thehacker.recipes/ad/persistence/sid-history)
 
@@ -18,22 +18,23 @@ pip install -r requirements.txt
 
 ---
 
-## Two injection methods
+## Three injection methods
 
-| | DSInternals (default) | DRSUAPI (stealth) |
-|---|---|---|
-| **What it does** | Stops NTDS, modifies ntds.dit offline via DSInternals, restarts NTDS | Calls `DRSAddSidHistory` (opnum 20) over RPC |
-| **Privileged SIDs** (DA, EA, krbtgt) | Yes | No (SID-filtered at trust boundary) |
-| **Same-domain injection** | Yes | No (error 8534 — same forest) |
-| **Cross-forest injection** | Yes | Yes |
-| **Requires** | Domain Admin on the DC | DA + auditing + audit groups + cross-forest trust |
-| **NTDS downtime** | ~5-10 seconds | None |
-| **Stealth** | Lower (stops NTDS, creates service, writes to disk) | Higher (pure RPC, no disk writes) |
-| **Best for** | Privilege escalation (RID < 1000) | Stealth persistence (RID > 1000, cross-forest) |
+| | DSInternals (default) | DRSUAPI (legacy) | DCShadow (replication) |
+|---|---|---|---|
+| **What it does** | Stops NTDS, modifies ntds.dit offline via DSInternals, restarts NTDS | Calls `DRSAddSidHistory` (opnum 20) over RPC | Registers a rogue DC and pushes crafted replication data |
+| **Privileged SIDs** (DA, EA, krbtgt) | Yes | No (SID-filtered at trust boundary) | Yes |
+| **Same-domain injection** | Yes | No (error 8534 — same forest) | Yes |
+| **Cross-forest injection** | Yes | Yes | Yes |
+| **Requires** | Domain Admin on the DC | DA + auditing + audit groups + cross-forest trust | DA + root on attacker (port 135) + network reachability |
+| **NTDS downtime** | ~5-10 seconds | None | None |
+| **Stealth** | Lower (stops NTDS, creates service, writes to disk) | Higher (pure RPC, no disk writes) | Highest (native replication, no disk artifacts on DC) |
+| **Best for** | Privilege escalation (RID < 1000) | Stealth persistence (RID > 1000, cross-forest) | Zero-downtime injection with full SID control |
 
 **When to use which:**
-- **Need Domain Admins / Enterprise Admins / krbtgt?** → DSInternals (only method that can inject RID < 1000)
+- **Need Domain Admins / Enterprise Admins / krbtgt?** → DSInternals or DCShadow (can inject any SID)
 - **Cross-forest, stealth matters, RID > 1000?** → DRSUAPI (pure RPC, no NTDS downtime, no disk artifacts)
+- **No NTDS downtime + privileged SIDs?** → DCShadow (native replication, requires root and network access)
 
 ---
 
@@ -86,6 +87,30 @@ DRSUAPI is the stealth option — pure RPC, no disk writes, no service creation,
 | Audit groups | Local groups `$SRC_DOMAIN$$$` and `$DST_DOMAIN$$$` must exist on both DCs |
 | Source domain credentials | `--src-username`, `--src-password`, `--src-domain` |
 | Domain Admin on destination | The authenticated user must be DA in the target domain |
+
+## Injection — DCShadow (replication)
+
+```bash
+# Inject Domain Admins via DCShadow (requires root for port 135)
+sudo python3 sidhistory.py -d lab1.local -u da-admin -p 'Password123!' --dc-ip 192.168.56.10 \
+    --target user1 --inject domain-admins --method dcshadow --attacker-ip 192.168.56.1 --force
+
+# With custom rogue DC name
+sudo python3 sidhistory.py -d lab1.local -u da-admin -p 'Password123!' --dc-ip 192.168.56.10 \
+    --target user1 --inject domain-admins --method dcshadow --attacker-ip 192.168.56.1 \
+    --computer-name YOURPC001 --computer-password 'RoguePass123!' --force
+```
+
+DCShadow uses native AD replication to inject sIDHistory — no NTDS downtime, no disk artifacts on the DC. It registers a temporary rogue DC, serves crafted replication data when the legitimate DC pulls changes, then cleans up all AD objects.
+
+### DCShadow prerequisites
+
+| Requirement | Details |
+|---|---|
+| Domain Admin | Needed to create machine account, nTDSDSA, DNS records |
+| Root on Linux | Port 135 (EPM) requires root/sudo |
+| Network reachability | DC must be able to connect to attacker on ports 135 and 1337 |
+| `--attacker-ip` | IP address of the attacker machine, reachable from the DC |
 
 ---
 
@@ -140,16 +165,25 @@ python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 --lis
 ## Architecture
 
 ```
-sidhistory.py              CLI entry point & argument handling
+sidhistory.py                  CLI entry point & argument handling
   └── core/
-      ├── attack.py        Orchestrator (wires everything together)
-      ├── auth.py          Authentication (5 methods, ldap3 + impacket)
-      ├── ldap_operations.py  LDAP queries & domain enumeration
-      ├── injection.py     DSInternals injection via SMB + SCMR
-      ├── drsuapi.py       DRSAddSidHistory RPC (opnum 20)
-      ├── scanner.py       Domain-wide auditing & risk assessment
-      ├── sid_utils.py     SID binary conversion, presets, well-known SIDs
-      └── output.py        Console/JSON/CSV formatting
+      ├── attack.py            Orchestrator (wires everything together)
+      ├── auth.py              Authentication (5 methods, ldap3 + impacket)
+      ├── ldap_operations.py   LDAP queries & domain enumeration
+      ├── sid_utils.py         SID binary conversion, presets, well-known SIDs
+      ├── scanner.py           Domain-wide auditing & risk assessment
+      ├── output.py            Console/JSON/CSV formatting
+      └── methods/
+          ├── dsinternals/
+          │   └── injector.py  DSInternals injection via SMB + SCMR
+          ├── drsuapi/
+          │   └── client.py    DRSAddSidHistory RPC (opnum 20)
+          └── dcshadow/
+              ├── attack.py    DCShadow orchestrator
+              ├── rogue_dc.py  Machine account, DNS, DC registration
+              ├── rpc_server.py  EPM + DRSUAPI RPC servers
+              ├── kerberos.py  Server-side Kerberos auth
+              └── replication.py  Build DsGetNCChanges response
 ```
 
 ## Detection
@@ -172,6 +206,16 @@ sidhistory.py              CLI entry point & argument handling
 | **File artifacts** | `C:\Windows\Temp\__pysidhistory_*` |
 | **SMB writes** | File upload to `\\DC\ADMIN$\Temp\` |
 
+### DCShadow method
+
+| Indicator | What to look for |
+|-----------|-----------------|
+| **Event 4742** | Computer account changed (machine account created/modified) |
+| **Event 4662** | Operation performed on directory object (nTDSDSA creation) |
+| **Event 4929** | Active Directory replica source naming context was removed |
+| **Replication metadata** | Unexpected `DRSGetNCChanges` from non-DC IP |
+| **nTDSDSA objects** | Short-lived nTDSDSA in Sites configuration |
+
 ## Lab
 
 **[sIDHistoryLab](https://github.com/felixbillieres/sIDHistoryLab)** — Two Windows Server 2019 DCs with cross-forest trust, fully automated with Vagrant.
@@ -193,6 +237,9 @@ python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 --aud
 - [Dirkjan Mollema: SID Filtering](https://dirkjanm.io/active-directory-forest-trusts-part-one-how-does-sid-filtering-work/)
 - [impacket](https://github.com/fortra/impacket)
 - [MITRE ATT&CK T1134.005](https://attack.mitre.org/techniques/T1134/005/)
+- [MITRE ATT&CK T1207 — Rogue Domain Controller](https://attack.mitre.org/techniques/T1207/)
+- [DCShadow](https://www.dcshadow.com/) — Original research by Le Toux & Delpy
+- [ShutdownRepo/dcshadow](https://github.com/ShutdownRepo/dcshadow) — Python reference implementation
 
 ## Author
 
