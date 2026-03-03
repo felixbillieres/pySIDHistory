@@ -1,5 +1,5 @@
 """
-pySIDHistory v2 - Core Module
+pySIDHistory v3 - Core Module
 """
 
 from .attack import SIDHistoryAttack

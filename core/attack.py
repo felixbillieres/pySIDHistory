@@ -1,5 +1,5 @@
 """
-SID History Attack Implementation v2
+SID History Attack Implementation v3
 Main orchestrator: wires up authentication, LDAP operations,
 DRSUAPI calls, DSInternals injection, scanning, and output formatting.
 """

