@@ -104,15 +104,6 @@ python3 main.py -d lab1.local -u da-admin -p 'Password123!' --dc-ip 192.168.56.1
     --target user1 --inject S-1-5-21-3522073385-2671856591-2684624930-512 --force
 ```
 
-### Auto-upload (DC has no internet)
-
-If the target DC can't download DSInternals (no internet, NuGet blocked), use `--auto-upload` to download it on your attacker machine and upload via SMB:
-
-```bash
-python3 main.py -d lab2.local -u da-admin2 -p 'Password123!' --dc-ip 192.168.56.11 \
-    --target user2 --inject domain-admins --force --auto-upload
-```
-
 ### DSInternals risks
 
 The DSInternals method stops the NTDS service to get exclusive access to `ntds.dit`. This is fundamentally different from tools like `secretsdump` (DCSync via `DRSGetNCChanges` — read-only, zero risk) or `ntdsutil` (VSS snapshot — read-only copy).
