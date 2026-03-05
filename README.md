@@ -2,6 +2,8 @@
 
 Remote SID History injection & auditing from Linux.
 
+> **Warning** — The DSInternals method **stops the NTDS service** on the target DC to modify `ntds.dit` offline. This causes a brief authentication outage (~5-10s) and carries a risk of service disruption if the restart fails. **Do not run against production domain controllers.** This tool is intended for authorized security assessments, lab environments, and blue team research (IoC identification, detection engineering). Run it from Linux, not Windows. Provided as-is with no support guarantee.
+
 > *"There is currently no way to exploit this technique purely from a distant UNIX-like machine"* — [The Hacker Recipes](https://www.thehacker.recipes/ad/persistence/sid-history)
 
 **pySIDHistory** injects privileged SIDs into the `sIDHistory` attribute of a user account over the network. The target user gains Domain Admin privileges without appearing in `net group "Domain Admins"`, BloodHound group membership queries, or standard audit scripts.
