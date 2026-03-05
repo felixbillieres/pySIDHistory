@@ -1,5 +1,5 @@
 """
-SID History Attack Implementation v3
+SID History Attack Implementation
 Main orchestrator: wires up authentication, LDAP operations,
 DRSUAPI calls, DSInternals injection, scanning, and output formatting.
 """
@@ -10,7 +10,6 @@ from typing import Optional, List, Dict, Any
 from .auth import AuthenticationManager
 from .ldap_operations import LDAPOperations
 from .sid_utils import SIDConverter
-from .output import OutputFormatter
 from .scanner import DomainScanner, AuditReport
 
 
@@ -34,8 +33,6 @@ class SIDHistoryAttack:
         self.drsuapi_client = None
         self.base_dn = SIDConverter.domain_to_dn(domain)
         self.domain_sid = None
-
-        self._formatter = OutputFormatter()
         self._scanner = None
 
         logging.debug(f"Initialized targeting {dc_ip} ({domain})")
@@ -400,13 +397,6 @@ class SIDHistoryAttack:
             logging.error("Not connected")
             return None
         return self._scanner.full_audit()
-
-    def scan_user(self, sam_account_name: str):
-        """Scan a single object for sIDHistory issues."""
-        if not self._scanner:
-            logging.error("Not connected")
-            return None
-        return self._scanner.scan_user(sam_account_name)
 
     def enumerate_trusts(self) -> List[Dict]:
         """Enumerate domain trusts."""

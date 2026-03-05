@@ -44,12 +44,6 @@ class AuthenticationManager:
         self._last_auth_method = None
         self._last_auth_params = {}
 
-    @property
-    def credentials(self):
-        """Return stored credentials tuple for impacket reuse."""
-        return (self._username, self._password, self.domain,
-                self._lm_hash, self._nt_hash, self._aes_key, self._do_kerberos)
-
     def create_server(self, use_ssl: bool = False, port: Optional[int] = None,
                      cert_file: Optional[str] = None, key_file: Optional[str] = None) -> Server:
         """Create ldap3 Server object."""

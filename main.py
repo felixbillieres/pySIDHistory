@@ -1,28 +1,28 @@
 #!/usr/bin/env python3
 """
-pySIDHistory v3 - Remote SID History Injection & Audit Tool
+pySIDHistory - Remote SID History Injection & Audit Tool
 
 Author: github.com/felixbillieres
 License: MIT
 """
 
 import argparse
+import builtins
 import sys
 import logging
-from typing import Optional
 
 from core import SIDHistoryAttack, AuthenticationManager
 from core.output import OutputFormatter
 
 
 BANNER = r"""
-             _____ _____ ____  _   _ _     _
+             _____ _____ ____ _   _ _     _
  _ __  _   _/ ___||_ _||  _ \| | | (_)___| |_ ___  _ __ _   _
 | '_ \| | | \___ \ | | | | | | |_| | / __| __/ _ \| '__| | | |
 | |_) | |_| |___) || | | |_| |  _  | \__ \ || (_) | |  | |_| |
 | .__/ \__, |____/|___||____/|_| |_|_|___/\__\___/|_|   \__, |
 |_|    |___/                                             |___/
-    Remote SID History Injection & Audit Tool  v3
+    Remote SID History Injection & Audit Tool
     DSInternals + DRSUAPI | github.com/felixbillieres
 """
 
@@ -51,7 +51,7 @@ def setup_logging(verbose: bool = False, quiet: bool = False):
 def build_parser():
     """Build the argument parser."""
     parser = argparse.ArgumentParser(
-        description='pySIDHistory v3 - Remote SID History Injection & Audit Tool',
+        description='pySIDHistory - Remote SID History Injection & Audit Tool',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 injection methods:
@@ -348,11 +348,10 @@ def main():
 
     # Output redirect
     output_file = None
+    original_print = builtins.print
     if args.output_file:
         try:
             output_file = open(args.output_file, 'w')
-            import builtins
-            original_print = builtins.print
             def file_print(*a, **kw):
                 kw['file'] = output_file
                 original_print(*a, **kw)
@@ -394,8 +393,7 @@ def main():
         attacker.disconnect()
         if output_file:
             output_file.close()
-            import builtins
-            builtins.print = original_print
+        builtins.print = original_print
 
 
 if __name__ == '__main__':

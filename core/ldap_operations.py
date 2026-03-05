@@ -63,10 +63,6 @@ class LDAPOperations:
             logging.error(f"Error retrieving SID for {sam_account_name}: {e}")
             return None
 
-    # Keep backward compatibility
-    def get_user_sid(self, sam_account_name: str) -> Optional[str]:
-        return self.get_object_sid(sam_account_name)
-
     def get_object_dn(self, sam_account_name: str) -> Optional[str]:
         """Retrieve the DN of any object by sAMAccountName."""
         try:
@@ -90,10 +86,6 @@ class LDAPOperations:
         except LDAPException as e:
             logging.error(f"Error retrieving DN for {sam_account_name}: {e}")
             return None
-
-    # Keep backward compatibility
-    def get_user_dn(self, sam_account_name: str) -> Optional[str]:
-        return self.get_object_dn(sam_account_name)
 
     def get_object_info(self, sam_account_name: str) -> Optional[Dict[str, Any]]:
         """Get comprehensive info about an object."""
@@ -259,30 +251,6 @@ class LDAPOperations:
             logging.error(f"Error getting domain SID: {e}")
             return None
 
-    def get_name_by_sid(self, sid_string: str) -> Optional[str]:
-        """Resolve a SID string to a sAMAccountName via LDAP."""
-        try:
-            sid_bytes = self.sid_converter.string_to_bytes(sid_string)
-            escaped = ''.join(f'\\{b:02x}' for b in sid_bytes)
-            search_filter = f"(objectSid={escaped})"
-
-            self.connection.search(
-                search_base=self.base_dn,
-                search_filter=search_filter,
-                search_scope=SUBTREE,
-                attributes=['sAMAccountName'],
-                size_limit=1
-            )
-
-            if self.connection.entries:
-                return str(self.connection.entries[0].sAMAccountName)
-
-            return None
-
-        except Exception as e:
-            logging.debug(f"SID lookup failed for {sid_string}: {e}")
-            return None
-
     def enumerate_trusts(self) -> List[Dict[str, Any]]:
         """Enumerate domain trusts via LDAP."""
         trusts = []
@@ -322,65 +290,6 @@ class LDAPOperations:
             logging.error(f"Error enumerating trusts: {e}")
 
         return trusts
-
-    def search_by_sid(self, sid: str) -> Optional[str]:
-        """Search for an object by SID, return sAMAccountName."""
-        try:
-            sid_bytes = self.sid_converter.string_to_bytes(sid)
-            if not sid_bytes:
-                return None
-
-            sid_hex = ''.join([f'\\{b:02x}' for b in sid_bytes])
-            search_filter = f"(objectSid={sid_hex})"
-
-            self.connection.search(
-                search_base=self.base_dn,
-                search_filter=search_filter,
-                search_scope=SUBTREE,
-                attributes=['sAMAccountName', 'objectClass']
-            )
-
-            if not self.connection.entries:
-                return None
-
-            return str(self.connection.entries[0].sAMAccountName)
-
-        except LDAPException as e:
-            logging.error(f"Error searching by SID: {e}")
-            return None
-
-    def check_sid_history_acl(self, sam_account_name: str) -> Optional[Dict]:
-        """
-        Check the security descriptor on an object to see who can write sIDHistory.
-        Returns basic ACL info (requires nTSecurityDescriptor read access).
-        """
-        try:
-            safe_name = escape_filter_chars(sam_account_name)
-            search_filter = f"(sAMAccountName={safe_name})"
-
-            # Request SD with LDAP_SERVER_SD_FLAGS_OID control
-            # 0x04 = DACL_SECURITY_INFORMATION
-            from ldap3 import SEQUENCE_TYPES
-            self.connection.search(
-                search_base=self.base_dn,
-                search_filter=search_filter,
-                search_scope=SUBTREE,
-                attributes=['nTSecurityDescriptor', 'distinguishedName'],
-                controls=[('1.2.840.113556.1.4.801', True, b'\x30\x03\x02\x01\x04')]
-            )
-
-            if not self.connection.entries:
-                return None
-
-            return {
-                'dn': str(self.connection.entries[0].distinguishedName),
-                'hasSD': bool(self.connection.entries[0].nTSecurityDescriptor),
-                'note': 'Full ACL parsing requires additional tooling (e.g., BloodHound, dacledit)'
-            }
-
-        except Exception as e:
-            logging.debug(f"ACL check failed (may need elevated privileges): {e}")
-            return None
 
     # ─── HELPER METHODS ──────────────────────────────────────────────────
 

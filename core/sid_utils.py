@@ -6,7 +6,7 @@ well-known SID constants, presets, and SID analysis.
 
 import struct
 import logging
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict
 
 
 # Well-known domain-relative RIDs
@@ -239,11 +239,6 @@ class SIDConverter:
         return f"{domain_sid}-{rid}"
 
     @staticmethod
-    def get_preset_list() -> List[str]:
-        """Return list of available preset names."""
-        return sorted(PRIVILEGED_PRESETS.keys())
-
-    @staticmethod
     def resolve_sid_name(sid_string: str, domain_sid: Optional[str] = None) -> str:
         """
         Resolve a SID to a human-readable name using well-known SID tables.
@@ -298,20 +293,3 @@ class SIDConverter:
         """
         return ','.join([f'DC={part}' for part in domain.split('.')])
 
-    @staticmethod
-    def dn_to_domain(dn: str) -> str:
-        """
-        Convert distinguished name to domain name.
-
-        Args:
-            dn: Distinguished name (e.g., 'DC=example,DC=com')
-
-        Returns:
-            Domain name (e.g., 'example.com')
-        """
-        parts = []
-        for component in dn.split(','):
-            component = component.strip()
-            if component.upper().startswith('DC='):
-                parts.append(component[3:])
-        return '.'.join(parts)
