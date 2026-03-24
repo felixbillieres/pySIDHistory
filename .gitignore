@@ -132,3 +132,19 @@ dmypy.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Old docs (replaced by docs/ folder)
+ARCHITECTURE.md
+EXAMPLES.md
+FEATURES.md
+TECHNICAL.md
+
+# Lab runtime (keep Vagrantfile + scripts, ignore state)
+lab/.vagrant/
+docs/pictures/
+todo.md
+
+# DCShadow (WIP, not yet integrated)
+core/methods/dcshadow/
+core/dcshadow.py
+
